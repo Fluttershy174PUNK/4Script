@@ -24,12 +24,25 @@ sudo bash seq_vps.sh
 
 `chmod +x` не нужен: `sudo bash seq_vps.sh` запускает файл напрямую.
 
-> **Если нет curl** (минимальный образ):
->
-> ```bash
-> wget -qO seq_vps.sh https://raw.githubusercontent.com/Fluttershy174PUNK/ezSEQserver/main/seq_vps.sh
-> sudo bash seq_vps.sh
-> ```
+### Если curl не установлен
+
+На минимальных образах `curl` может отсутствовать — поставь его (команда
+сама подберётся под твой дистрибутив):
+
+```bash
+sudo apt install -y curl   2>/dev/null || sudo dnf install -y curl || sudo yum install -y curl
+```
+
+Или скачай скрипт без curl, штатным `wget` (обычно он есть даже
+на минималках):
+
+```bash
+wget -qO seq_vps.sh https://raw.githubusercontent.com/Fluttershy174PUNK/ezSEQserver/main/seq_vps.sh
+sudo bash seq_vps.sh
+```
+
+Нет ни curl, ни wget? Скачай на своём компьютере и закинь по `scp`
+(см. ниже).
 
 > **Скрипт про безопасность — не запускай вслепую.** Хорошая привычка:
 >
