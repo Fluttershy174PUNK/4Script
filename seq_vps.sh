@@ -329,16 +329,20 @@ detect_distro() {
 	((TERM_WIDTH < 60)) && TERM_WIDTH=60
 }
 
+# Шаблон статус-файла в stdout: генератор отдельно от файла, чтобы можно было
+# проверять без root — STAGE_STATUS_FILE readonly.
+stage_status_template() {
+	echo "# Статус этапов seq_vps (completed / failed / skipped / not_started)"
+	local def num key
+	for def in "${STAGE_DEFS[@]}"; do
+		IFS='|' read -r num key _ _ _ _ <<<"$def"
+		[[ -n "$key" ]] && echo "$key=not_started"
+	done
+}
+
 init_status_file() {
 	[[ -f "$STAGE_STATUS_FILE" ]] && return 0
-	{
-		echo "# Статус этапов seq_vps (completed / failed / skipped / not_started)"
-		local def num key
-		for def in "${STAGE_DEFS[@]}"; do
-			IFS='|' read -r num key _ _ _ _ <<<"$def"
-			[[ -n "$key" ]] && echo "$key=not_started"
-			done
-	} >"$STAGE_STATUS_FILE"
+	stage_status_template >"$STAGE_STATUS_FILE"
 }
 
 check_root() {
@@ -1128,6 +1132,23 @@ _ssh_validate() {
 	sshd -t 2>&1 | tee -a "$LOG_FILE"
 }
 
+# Проверка кандидата в drop-in ДО его установки. Сам drop-in через sshd -t
+# не проверить: без HostKey sshd всегда падает, а валидность зависит от
+# основного конфига и соседних файлов. Поэтому собираем пробу:
+# Include <кандидат> + реальный sshd_config (первое значение побеждает).
+_sshd_config_ok() {
+	local cand="$1" probe rc
+	probe=$(mktemp)
+	{
+		echo "Include $cand"
+		cat /etc/ssh/sshd_config 2>/dev/null
+	} >"$probe"
+	sshd -t -f "$probe" 2>&1 | tee -a "$LOG_FILE"
+	rc=${PIPESTATUS[0]}
+	rm -f "$probe"
+	return "$rc"
+}
+
 # Перезапуск SSH (с сокетом, если он есть) + проверка, что порт реально слушается
 _ssh_restart() {
 	systemctl restart "$SSH_SERVICE" 2>/dev/null || {
@@ -1195,8 +1216,24 @@ stage_ssh_config() {
 	backup_file "$cfg" "stage5_ssh_config"
 	[[ ! -f "$cfg" ]] && echo "# seq_vps drop-in config" >"$cfg"
 
-	# Хелпер
-	_ssh_set() { if grep -q "^$1 " "$cfg"; then sed -i "s/^$1 .*/$1 $2/" "$cfg"; else echo "$1 $2" >>"$cfg"; fi; }
+	# Хелпер — пишет drop-in через буфер и валидирует ДО установки:
+	# невалидная правка (опечатка, системный лимит) не превратит живой конфиг в мёртвый.
+	_ssh_set() {
+		local tmp
+		tmp=$(mktemp)
+		if grep -q "^$1 " "$cfg"; then
+			sed "s/^$1 .*/$1 $2/" "$cfg" >"$tmp"
+		else
+			cp "$cfg" "$tmp"
+			echo "$1 $2" >>"$tmp"
+		fi
+		if ! _sshd_config_ok "$tmp"; then
+			log_err "$1 $2 не проходит sshd -t — конфиг не изменён"
+			rm -f "$tmp"
+			return 1
+		fi
+		mv "$tmp" "$cfg"
+	}
 
 	local sc
 	sc=$(sshd -T 2>/dev/null)
@@ -1261,9 +1298,20 @@ stage_ssh_config() {
 		}
 		;;
 	3)
-		echo "  1) yes  2) no  3) prohibit-password"
+		echo "  1) prohibit-password (рекомендуется)  2) no  3) yes (небезопасно)"
 		read -rp "  ${ICON_ARROW} " c
-		case "$c" in 1) _ssh_set "PermitRootLogin" "yes" ;; 2) _ssh_set "PermitRootLogin" "no" ;; 3) _ssh_set "PermitRootLogin" "prohibit-password" ;; esac
+		case "$c" in
+		1 | "") _ssh_set "PermitRootLogin" "prohibit-password" ;;
+		2) _ssh_set "PermitRootLogin" "no" ;;
+		3)
+			echo -e "  ${C_RED}${ICON_WARN}  Прямой вход root по паролю/ключу — самый частый вектор атак.${C_RESET}"
+			confirm "Точно включить PermitRootLogin yes?" || {
+				log_info "Отменено"
+				return 0
+			}
+			_ssh_set "PermitRootLogin" "yes"
+			;;
+		esac
 		log_ok "PermitRootLogin изменён"
 		;;
 	4)

@@ -133,10 +133,17 @@ alone still lets PAM admit a password through keyboard-interactive
 authentication, so `KbdInteractiveAuthentication no` is set together with it
 (and removed together with it).
 
-**Validation before every restart.** `sshd -t` runs before each
-`systemctl restart ssh` — including the two restarts in the SFTP stage.
-An invalid config cancels the restart, so the server cannot be locked out by a
-typo.
+**Validation before every restart — and before every write.** A change to the
+SSH drop-in is built in a temporary file and checked with `sshd -t` *before* it
+replaces the real file, so a rejected value never reaches the live config. The
+probe is `Include <candidate>` plus the real `sshd_config`: a bare drop-in
+cannot be validated on its own, since without `HostKey` sshd always fails and
+the result also depends on the neighbouring files. A rejected change leaves the
+file untouched and reports which value failed. `sshd -t` also runs before each
+`systemctl restart ssh`, including the two restarts in the SFTP stage.
+
+**Root login.** `PermitRootLogin prohibit-password` (the safe option) is the
+default in the menu; `yes` requires an explicit second confirmation.
 
 **SELinux.** On Fedora/RHEL/Rocky/Alma changing the port runs
 `semanage port -a -t ssh_port_t -p tcp <port>` — without it sshd will not

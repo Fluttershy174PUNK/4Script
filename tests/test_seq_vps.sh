@@ -50,9 +50,17 @@ assert_eq "$(cut -d'|' -f6 <<<"$(stage_def 5)")" 'stage_ssh_config' 'stage_def f
 assert_eq "$(cut -d'|' -f6 <<<"$(stage_def stage15_bbr)")" 'stage_bbr' 'stage_def finds stage by status key'
 stage_def nosuchstage >/dev/null 2>&1 && fail 'stage_def accepts unknown input' || true
 
-# STAGE_STATUS_FILE объявлена readonly, поэтому подменить путь нельзя.
-# Проверяем главное: генератор берёт ключи из реестра, а не из своей копии списка.
-grep -q 'STAGE_DEFS' <(declare -f init_status_file) || fail 'init_status_file no longer reads the registry'
+# Генератор шаблона пишет в stdout, поэтому путь подменять не надо
+# (STAGE_STATUS_FILE readonly). Ключи берутся из реестра.
+tpl=$(mktemp)
+stage_status_template >"$tpl"
+for key in $seen_keys; do
+	grep -qx "$key=not_started" "$tpl" || fail "template misses $key"
+done
+# Обратный контроль: в шаблоне нет ключей, которых нет в реестре
+tpl_keys=$(sed -n 's/=not_started$//p' "$tpl" | sort)
+[[ "$tpl_keys" == "$(printf '%s\n' "$seen_keys" | tr -s ' ' '\n' | grep . | sort)" ]] || fail 'template and registry keys diverge'
+rm -f "$tpl"
 
 # Если на машине уже есть статус-файл (реальный сервер), в нём должны быть все ключи
 if [[ -f "$STAGE_STATUS_FILE" ]]; then
