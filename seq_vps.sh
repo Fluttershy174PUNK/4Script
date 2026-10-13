@@ -14,16 +14,15 @@ set -uo pipefail
 # ═══════════════════════════════════════════════════════════════════
 #  ЦВЕТА И СТИЛИ
 # ═══════════════════════════════════════════════════════════════════
-readonly C_RESET='\033[0m'
-readonly C_BOLD='\033[1m'
-readonly C_DIM='\033[2m'
-readonly C_RED='\033[0;31m'
-readonly C_GREEN='\033[0;32m'
-readonly C_YELLOW='\033[1;33m'
-readonly C_BLUE='\033[0;34m'
-readonly C_CYAN='\033[0;36m'
-readonly C_BG_RED='\033[41m'
-readonly C_BG_GREEN='\033[42m'
+if [[ -t 1 && ${TERM:-dumb} != dumb && ! ${NO_COLOR+x} ]]; then
+	readonly C_RESET='\033[0m' C_BOLD='\033[1m' C_DIM='\033[2m'
+	readonly C_RED='\033[0;31m' C_GREEN='\033[0;32m' C_YELLOW='\033[1;33m'
+	readonly C_BLUE='\033[0;34m' C_CYAN='\033[0;36m'
+	readonly C_BG_RED='\033[41m' C_BG_GREEN='\033[42m'
+else
+	readonly C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW=''
+	readonly C_BLUE='' C_CYAN='' C_BG_RED='' C_BG_GREEN=''
+fi
 
 # ── Иконки (работают в большинстве терминалов) ─────────────────────
 readonly ICON_OK='✔'
@@ -75,6 +74,7 @@ HAS_SELINUX=false
 # останавливаем по PID (kill), а не флагом — иначе вечный hang.
 spinner_start() {
 	local msg="${1:-}"
+	[[ -t 1 ]] || return 0
 	spinner_stop
 	(
 		local i=0 n=${#SPINNER_CHARS}
@@ -103,14 +103,17 @@ trap cleanup EXIT INT TERM
 
 # Прогресс-бар: progress_bar current total [label]
 progress_bar() {
-	local cur=$1 total=$2 label="${3:-}" w=30
-	local pct=$((cur * 100 / total))
-	local filled=$((cur * w / total))
-	local empty=$((w - filled))
+	local cur=$1 total=$2 label="${3:-}" w=30 filled empty pct bar
+	((total > 0)) || return 1
+	pct=$((cur * 100 / total))
+	filled=$((cur * w / total))
+	empty=$((w - filled))
 	printf "\r  ${C_BLUE}%s${C_RESET} [${C_GREEN}" "$label"
-	printf '%*s' "$filled" '' | tr ' ' '█'
+	printf -v bar '%*s' "$filled" ''
+	printf '%s' "${bar// /█}"
 	printf "${C_RESET}${C_DIM}"
-	printf '%*s' "$empty" '' | tr ' ' '░'
+	printf -v bar '%*s' "$empty" ''
+	printf '%s' "${bar// /░}"
 	printf "${C_RESET}] %3d%%" "$pct"
 }
 
@@ -121,8 +124,16 @@ log_warn() { log "${C_YELLOW}${ICON_WARN}${C_RESET} $1"; }
 log_err() { log "${C_RED}${ICON_FAIL}${C_RESET} $1"; }
 
 # Визуальные элементы
-hr() { printf "${C_DIM}%s${C_RESET}\n" "$(printf '%*s' "$TERM_WIDTH" '' | tr ' ' '─')"; }
-hr_thick() { printf "${C_BLUE}%s${C_RESET}\n" "$(printf '%*s' "$TERM_WIDTH" '' | tr ' ' '═')"; }
+hr() {
+	local line
+	printf -v line '%*s' "$TERM_WIDTH" ''
+	printf "${C_DIM}%s${C_RESET}\n" "${line// /─}"
+}
+hr_thick() {
+	local line
+	printf -v line '%*s' "$TERM_WIDTH" ''
+	printf "${C_BLUE}%s${C_RESET}\n" "${line// /═}"
+}
 
 # Заголовок этапа с иконкой
 stage_banner() {
@@ -134,14 +145,12 @@ stage_banner() {
 	echo ""
 }
 
-# Одноклавишное подтверждение (y/N)
+# Построчное подтверждение не оставляет Enter в буфере для следующего вопроса.
 confirm() {
-	local prompt="${1:-Продолжить?}" default="${2:-n}"
-	local hint
-	[[ "$default" == "y" ]] && hint="[Y/n]" || hint="[y/N]"
-	printf "  ${C_YELLOW}%s %s${C_RESET} " "$prompt" "$hint"
-	read -r -n1 -s answer
-	echo "$answer"
+	local prompt="${1:-Продолжить?}" default="${2:-n}" answer=""
+	[[ "$default" == "y" ]] && prompt+=" [Y/n] " || prompt+=" [y/N] "
+	printf "  ${C_YELLOW}%s${C_RESET}" "$prompt"
+	read -r answer || return 1
 	[[ "$default" == "y" ]] && { [[ "$answer" != "n" && "$answer" != "N" ]]; } || { [[ "$answer" == "y" || "$answer" == "Y" ]]; }
 }
 
@@ -304,6 +313,10 @@ severity_color() {
 	esac
 }
 
+ssh_port_from_config() {
+	awk '$1 == "port" { print $2; exit }' <<<"$1"
+}
+
 show_server_summary() {
 	local w=$((TERM_WIDTH - 2))
 	echo -e "${C_BOLD}${C_CYAN}┌─${C_RESET} ${C_BOLD}СВОДКА СЕРВЕРА${C_RESET} ${C_DIM}— Seq VPS Security${C_RESET}"
@@ -335,8 +348,9 @@ show_server_summary() {
 	local ssh_cfg
 	ssh_cfg=$(sshd -T 2>/dev/null || true) || true
 	local sp
-	sp=$(echo "$ssh_cfg" | grep "^port " | awk '{print $2}')
+	sp=$(ssh_port_from_config "$ssh_cfg")
 	sp=${sp:-22}
+	CURRENT_SSH_PORT=$sp
 	local pa
 	pa=$(echo "$ssh_cfg" | grep "^passwordauthentication " | awk '{print $2}')
 	pa=${pa:-yes}
@@ -509,6 +523,32 @@ repair_pkg() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 0: УТИЛИТЫ
+# ═══════════════════════════════════════════════════════════════════
+
+stage_utilities() {
+	stage_banner "$ICON_GEAR" "0" "Установка утилит"
+
+	echo "  ${C_BOLD}1)${C_RESET} micro  ${C_DIM}— удобный редактор${C_RESET}"
+	echo "  ${C_BOLD}2)${C_RESET} mc     ${C_DIM}— файловый менеджер${C_RESET}"
+	echo "  ${C_BOLD}3)${C_RESET} Обе утилиты"
+	echo "  ${C_BOLD}0)${C_RESET} Пропустить"
+	echo ""
+	read -rp "  ${ICON_ARROW} " choice
+	echo ""
+
+	case "$choice" in
+	1) pkg_install_retry "micro" ;;
+	2) pkg_install_retry "mc" ;;
+	3)
+		pkg_install_retry "micro"
+		pkg_install_retry "mc"
+		;;
+	*) log_info "Пропущено" ;;
+	esac
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  ЭТАП 1: ОБНОВЛЕНИЕ СИСТЕМЫ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -561,32 +601,6 @@ stage_update() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  ЭТАП 0: УТИЛИТЫ
-# ═══════════════════════════════════════════════════════════════════
-
-stage_utilities() {
-	stage_banner "$ICON_GEAR" "0" "Установка утилит"
-
-	echo "  ${C_BOLD}1)${C_RESET} micro  ${C_DIM}— удобный редактор${C_RESET}"
-	echo "  ${C_BOLD}2)${C_RESET} mc     ${C_DIM}— файловый менеджер${C_RESET}"
-	echo "  ${C_BOLD}3)${C_RESET} Обе утилиты"
-	echo "  ${C_BOLD}0)${C_RESET} Пропустить"
-	echo ""
-	read -rp "  ${C_BOLD}${ICON_ARROW}${C_RESET} " choice
-	echo ""
-
-	case "$choice" in
-	1) pkg_install_retry "micro" ;;
-	2) pkg_install_retry "mc" ;;
-	3)
-		pkg_install_retry "micro"
-		pkg_install_retry "mc"
-		;;
-	*) log_info "Пропущено" ;;
-	esac
-}
-
-# ═══════════════════════════════════════════════════════════════════
 #  ЭТАП 2: ПОЛЬЗОВАТЕЛИ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -613,7 +627,7 @@ stage_users() {
 	}
 	echo -e "  ${C_BOLD}S)${C_RESET} Пропустить"
 	echo ""
-	read -rp "  ${C_BOLD}${ICON_ARROW}${C_RESET} " action
+	read -rp "  ${ICON_ARROW} " action
 	echo ""
 
 	case "${action,,}" in
@@ -687,7 +701,7 @@ stage_users() {
 		echo "  4) Удалить из группы"
 		echo "  5) Все группы системы"
 		echo "  S) Назад"
-		read -rp "  ${C_BOLD}${ICON_ARROW}${C_RESET} " ga
+		read -rp "  ${ICON_ARROW} " ga
 		case "$ga" in
 		1) usermod -aG "$SUDO_GROUP" "$u" && log_ok "$u → $SUDO_GROUP" || log_err "Не удалось" ;;
 		2)
@@ -1024,7 +1038,7 @@ stage_ssh_config() {
 	local sc
 	sc=$(sshd -T 2>/dev/null)
 	local sp
-	sp=$(echo "$sc" | grep "^port " | awk '{print $2}' | head -1)
+	sp=$(ssh_port_from_config "$sc")
 	sp=${sp:-22}
 	# обновляем глобальный порт уже ПОСЛЕ того, как sp определён
 	CURRENT_SSH_PORT=$sp
@@ -1133,12 +1147,12 @@ stage_ssh_config() {
 		systemctl restart "$SSH_SERVICE"
 		log_ok "SSH перезапущен ($SSH_SERVICE)"
 		sleep 2
-		if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ":${sp} " 2>/dev/null; then
-			log_ok "SSH слушает на порту $sp"
-		elif command -v netstat &>/dev/null && netstat -tlnp 2>/dev/null | grep -q ":${sp} " 2>/dev/null; then
-			log_ok "SSH слушает на порту $sp"
+		if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ":${CURRENT_SSH_PORT} " 2>/dev/null; then
+			log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
+		elif command -v netstat &>/dev/null && netstat -tlnp 2>/dev/null | grep -q ":${CURRENT_SSH_PORT} " 2>/dev/null; then
+			log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
 		else
-			log_warn "Не удалось проверить порт $sp"
+			log_warn "Не удалось проверить порт $CURRENT_SSH_PORT"
 		fi
 	fi
 
@@ -1155,6 +1169,10 @@ stage_sftp_user() {
 	stage_banner "$ICON_LOCK" "6" "Создание SFTP пользователя"
 
 	read -rp "  Имя: " sfu
+	[[ "$sfu" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
+		log_err "Имя пользователя: латиница в нижнем регистре, цифры, _ и -"
+		return 1
+	}
 	id "$sfu" &>/dev/null && {
 		log_err "Пользователь $sfu уже существует"
 		update_stage_status "stage6_sftp_user" "failed"
@@ -1174,22 +1192,30 @@ stage_sftp_user() {
 		return 1
 	}
 
-	echo ""
-	echo "  Папка для chroot:"
-	echo "  1) /opt    2) /var/www    3) /srv    4) Своя"
-	read -rp "  ${ICON_ARROW} " fc
-	case "$fc" in 1) sff="/opt" ;; 2) sff="/var/www" ;; 3) sff="/srv" ;; 4) read -rp "  Путь: " sff ;; *) sff="/opt" ;; esac
-
-	useradd -M -s /usr/sbin/nologin -d "$sff" "$sfu"
-	echo "$sfu:$sfpw" | chpasswd
+	local chroot_dir="/srv/sftp/$sfu"
+	local nologin_shell
+	nologin_shell=$(command -v nologin || echo /usr/sbin/nologin)
+	install -d -o root -g root -m 755 /srv/sftp "$chroot_dir"
+	useradd -M -s "$nologin_shell" -d /upload "$sfu" || {
+		log_err "Не удалось создать пользователя $sfu"
+		return 1
+	}
+	install -d -o "$sfu" -g "$sfu" -m 755 "$chroot_dir/upload"
+	printf '%s:%s\n' "$sfu" "$sfpw" | chpasswd || {
+		userdel "$sfu" 2>/dev/null || true
+		rm -rf "$chroot_dir"
+		log_err "Не удалось задать пароль"
+		return 1
+	}
 
 	local sftp_cfg="$SSHD_CONFIG_D/98-sftp-$sfu.conf"
+	backup_file "$sftp_cfg" "stage6_sftp_user"
 	backup_file "/etc/ssh/sshd_config" "stage6_sftp_user"
 	cat >"$sftp_cfg" <<EOF
 # SFTP: $sfu (seq_vps)
 Match User $sfu
     ForceCommand internal-sftp
-    ChrootDirectory $sff
+    ChrootDirectory $chroot_dir
     PermitTunnel no
     AllowAgentForwarding no
     AllowTcpForwarding no
@@ -1198,19 +1224,20 @@ Match User $sfu
 EOF
 	chmod 644 "$sftp_cfg"
 
-	mkdir -p "$sff"
-	chown root:root "$sff"
-	chmod 755 "$sff"
-	mkdir -p "$sff/upload"
-	chown "$sfu:$sfu" "$sff/upload"
-	chmod 755 "$sff/upload"
-
 	if ! sshd -t 2>&1 | tee -a "$LOG_FILE"; then
 		log_err "Ошибка в конфиге SSH!"
 		rm -f "$sftp_cfg"
+		userdel "$sfu" 2>/dev/null || true
+		rm -rf "$chroot_dir"
 		return 1
 	fi
-	systemctl restart "$SSH_SERVICE"
+	if ! systemctl restart "$SSH_SERVICE"; then
+		log_err "Не удалось перезапустить SSH"
+		rm -f "$sftp_cfg"
+		userdel "$sfu" 2>/dev/null || true
+		rm -rf "$chroot_dir"
+		return 1
+	fi
 
 	echo ""
 	echo "  SSH-ключ для $sfu:"
@@ -1712,6 +1739,41 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 10: DNS
+# ═══════════════════════════════════════════════════════════════════
+
+stage_dns() {
+	stage_banner "$ICON_GLOBE" "10" "Настройка DNS"
+	backup_file "/etc/resolv.conf" "stage10_dns"
+
+	echo -e "${C_BOLD}Текущие DNS:${C_RESET}"
+	grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  ${C_DIM}(нет)${C_RESET}"
+
+	echo ""
+	echo "  1) Заменить    2) Добавить    3) Пропустить"
+	read -rp "  ${ICON_ARROW} " da
+	case "$da" in
+	1)
+		read -rp "  Серверы (через пробел): " srv
+		{
+			echo "# seq_vps"
+			for s in $srv; do echo "nameserver $s"; done
+		} >/etc/resolv.conf
+		log_ok "DNS заменены"
+		;;
+	2)
+		read -rp "  Серверы (через пробел): " srv
+		for s in $srv; do echo "nameserver $s" >>/etc/resolv.conf; done
+		log_ok "DNS добавлены"
+		;;
+	*) log_info "Пропущено" ;;
+	esac
+	echo ""
+	grep "^nameserver" /etc/resolv.conf 2>/dev/null
+	update_stage_status "stage10_dns" "completed"
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  ЭТАП 11: FISH SHELL
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1985,41 +2047,6 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  ЭТАП 10: DNS
-# ═══════════════════════════════════════════════════════════════════
-
-stage_dns() {
-	stage_banner "$ICON_GLOBE" "10" "Настройка DNS"
-	backup_file "/etc/resolv.conf" "stage10_dns"
-
-	echo -e "${C_BOLD}Текущие DNS:${C_RESET}"
-	grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  ${C_DIM}(нет)${C_RESET}"
-
-	echo ""
-	echo "  1) Заменить    2) Добавить    3) Пропустить"
-	read -rp "  ${ICON_ARROW} " da
-	case "$da" in
-	1)
-		read -rp "  Серверы (через пробел): " srv
-		{
-			echo "# seq_vps"
-			for s in $srv; do echo "nameserver $s"; done
-		} >/etc/resolv.conf
-		log_ok "DNS заменены"
-		;;
-	2)
-		read -rp "  Серверы (через пробел): " srv
-		for s in $srv; do echo "nameserver $s" >>/etc/resolv.conf; done
-		log_ok "DNS добавлены"
-		;;
-	*) log_info "Пропущено" ;;
-	esac
-	echo ""
-	grep "^nameserver" /etc/resolv.conf 2>/dev/null
-	update_stage_status "stage10_dns" "completed"
-}
-
-# ═══════════════════════════════════════════════════════════════════
 #  ЭТАП R: ОТКАТ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -2169,7 +2196,10 @@ main_menu() {
 		fi
 		echo ""
 
-		read -rp "  ${C_BOLD}${ICON_ARROW}${C_RESET} " choice
+		if ! read -rp "  ${ICON_ARROW} " choice; then
+			log_info "Ввод завершён"
+			return 0
+		fi
 
 		case "${choice,,}" in
 		0) stage_utilities ;;
@@ -2198,7 +2228,7 @@ main_menu() {
 		esac
 
 		echo ""
-		read -rp "  ${C_DIM}Enter — в меню...${C_RESET} "
+		read -rp "  Enter — в меню... " _ || return 0
 	done
 }
 
