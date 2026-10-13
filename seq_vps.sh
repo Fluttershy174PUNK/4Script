@@ -574,9 +574,15 @@ show_server_summary() {
 	if [[ $ssh_score -le 2 ]]; then
 		echo -e "\n  ${C_YELLOW}${ICON_WARN}  SSH нуждается в усилении — этапы 4 и 5${C_RESET}"
 	fi
-	if ! command -v ufw &>/dev/null || ! ufw status 2>/dev/null | grep -q "Status: active"; then
-		echo -e "  ${C_YELLOW}${ICON_WARN}  Фаервол неактивен — этап 7${C_RESET}"
+	# проверка по реальному фаерволу: на RHEL ufw не установлен вовсе,
+	# и старая проверка вечно показывала «неактивен» на включённом firewalld
+	local fw_active=false
+	if [[ "$fw" == firewalld ]]; then
+		firewall-cmd --state 2>/dev/null | grep -q running && fw_active=true
+	elif command -v ufw &>/dev/null; then
+		ufw status 2>/dev/null | grep -q "Status: active" && fw_active=true
 	fi
+	$fw_active || echo -e "  ${C_YELLOW}${ICON_WARN}  Фаервол неактивен — этап 7${C_RESET}"
 	if ! command -v cscli &>/dev/null && ! systemctl is-active --quiet fail2ban 2>/dev/null; then
 		echo -e "  ${C_YELLOW}${ICON_WARN}  Защита от атак не установлена — этап 9${C_RESET}"
 	fi
@@ -1870,18 +1876,37 @@ _install_fail2ban() {
 	local banaction=""
 	[[ "$(_fw_cmd)" == firewalld ]] && banaction="banaction = firewallcmd-ipset"
 
-	# backend systemd требует python3-systemd; без него jail не стартует,
-	# поэтому ставим пакет, а если его нет в репо — уходим на polling по логу
-	local backend="backend = %(sshd_backend)s"
-	if ! dpkg -s python3-systemd &>/dev/null 2>&1; then
-		pkg_install_retry "python3-systemd" || true
+	# Fail2Ban с systemd-journal требует python3-systemd (на Debian не в
+	# зависимостях), а polling требует живого /var/log/auth.log (нет без rsyslog).
+	# Если нет ни того, ни другого — jail не стартует и падает весь сервис,
+	# поэтому лучше честно отключить jail, чем оставить молча мёртвый fail2ban.
+	local sshd_jail=""
+	local has_journal=false
+	dpkg -s python3-systemd &>/dev/null 2>&1 || rpm -q python3-systemd &>/dev/null 2>&1 || pkg_install_retry "python3-systemd" || true
+	if dpkg -s python3-systemd &>/dev/null 2>&1 || rpm -q python3-systemd &>/dev/null 2>&1; then
+		has_journal=true
 	fi
-	if ! dpkg -s python3-systemd &>/dev/null 2>&1 && ! rpm -q python3-systemd &>/dev/null 2>&1; then
-		backend="backend = polling"
-		log_info "python3-systemd недоступен — Fail2Ban будет читать лог напрямую"
+	if $has_journal; then
+		sshd_jail="enabled = true
+port = $sp
+backend = systemd
+maxretry = 3
+bantime = 24h"
+	elif [[ -e /var/log/auth.log ]]; then
+		sshd_jail="enabled = true
+port = $sp
+logpath = %(sshd_log)s
+backend = polling
+maxretry = 3
+bantime = 24h"
+		log_info "python3-systemd нет — Fail2Ban читает /var/log/auth.log напрямую"
+	else
+		log_warn "Нет python3-systemd и нет /var/log/auth.log — jail SSH отключён"
+		log_warn "  включить: apt-get install python3-systemd  (или rsyslog)"
 	fi
 
-	cat >"$f2b_jail" <<EOF
+	{
+		cat <<EOF
 [DEFAULT]
 bantime = 1h
 findtime = 10m
@@ -1890,18 +1915,22 @@ ignoreip = 127.0.0.1/8 ::1
 ${banaction}
 
 [sshd]
-enabled = true
-port = $sp
-logpath = %(sshd_log)s
-${backend}
-maxretry = 3
-bantime = 24h
 EOF
+		[[ -n "$sshd_jail" ]] && echo "$sshd_jail"
+	} >"$f2b_jail"
 
 	systemctl enable fail2ban 2>/dev/null || true
 	systemctl restart fail2ban 2>/dev/null || true
 	sleep 2
-	systemctl is-active --quiet fail2ban && log_ok "Fail2Ban запущен (SSH: порт $sp, 3 попытки → бан 24ч)" || log_warn "Fail2Ban не запустился"
+	if systemctl is-active --quiet fail2ban; then
+		if [[ -n "$sshd_jail" ]]; then
+			log_ok "Fail2Ban запущен (SSH: порт $sp, 3 попытки → бан 24ч)"
+		else
+			log_warn "Fail2Ban запущен, но SSH не защищён — см. предупреждение выше"
+		fi
+	else
+		log_warn "Fail2Ban не запустился: systemctl status fail2ban"
+	fi
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2454,9 +2483,9 @@ main_menu() {
 			;;
 		*)
 			if stage_def "${choice,,}" >/dev/null 2>&1; then
-						run_stage "${choice,,}"
+				run_stage "${choice,,}"
 			else
-						log_err "Неверный выбор"
+				log_err "Неверный выбор"
 			fi
 			;;
 		esac
