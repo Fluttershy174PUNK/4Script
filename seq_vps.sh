@@ -564,9 +564,11 @@ show_server_summary() {
 	}
 	$has_idps || echo -e "  ${C_DIM}не установлена (CrowdSec/Fail2Ban)${C_RESET}"
 
-	# ── DNS ──
+	# ── DNS ── (у resolved в resolv.conf всегда 127.0.0.53 — берём реальные)
 	echo -e "\n${C_BOLD}${ICON_GLOBE}  DNS:${C_RESET}"
-	[[ -f /etc/resolv.conf ]] && grep "^nameserver" /etc/resolv.conf | sed 's/^/  /' 2>/dev/null || echo -e "  ${C_DIM}(не настроены)${C_RESET}"
+	local dns_list
+	dns_list=$(_dns_current)
+	[[ -n "$dns_list" ]] && echo "$dns_list" | sed 's/^/  /' || echo -e "  ${C_DIM}(не настроены)${C_RESET}"
 
 	# ── Подключение ──
 	local ip_addr
