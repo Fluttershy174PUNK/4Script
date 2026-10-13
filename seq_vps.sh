@@ -1235,7 +1235,9 @@ _ssh_restart() {
 	sleep 2
 	# Какие порты SSH реально слушает сейчас (из ядра, а не из файлов)
 	_ssh_listen_ports
+	local new_port_live=false
 	if [[ " $_seen_ports " == *" ${CURRENT_SSH_PORT} "* ]]; then
+		new_port_live=true
 		log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
 	else
 		if _ssh_socket_active; then
@@ -1253,12 +1255,36 @@ _ssh_restart() {
 	done
 	[[ -n "$extra" ]] && log_warn "Кроме $CURRENT_SSH_PORT слушаются порты ${extra% } — уберите чужие 'Port' из $SSHD_CONFIG_D"
 
-	# Прежний порт закрываем только теперь, когда новый точно работает:
-	# до рестарта он был единственной дверью на случай провала.
+	# Прежний порт закрываем только когда новый подтверждён в двух местах:
+	# в ядре (слушается) и снаружи (TCP-соединение проходит через фаервол).
+	# Рестарт sshd сам по себе не доказывает доступность — по факту смены порта
+	# раньше именно на этом и терялся доступ.
 	if [[ -n "${_wanted_close_port:-}" && "$_wanted_close_port" != "$CURRENT_SSH_PORT" ]]; then
-		_fw_close_ssh_port "$_wanted_close_port"
-		_wanted_close_port=""
+		if $new_port_live && _ssh_port_reachable "$CURRENT_SSH_PORT"; then
+			_fw_close_ssh_port "$_wanted_close_port"
+			_wanted_close_port=""
+		else
+			log_warn "Старый порт $_wanted_close_port оставлен открытым: новый порт $CURRENT_SSH_PORT ещё не подтверждён извне"
+			log_info "  Проверьте вход: ssh -p $CURRENT_SSH_PORT root@<адрес> — затем закройте старый порт в фаерволе"
+		fi
 	fi
+}
+
+# Доступен ли порт снаружи: пробуем установить TCP-соединение на свой адрес.
+# Локальная проверка не идеальна для удалённого клиента, но именно она
+# отличается «слушается» от «пускает фаервол/маршрут».
+_ssh_port_reachable() {
+	local port="$1" ip
+	ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+	[[ -n "$ip" ]] || return 0
+	if command -v nc &>/dev/null; then
+		nc -z -w 3 "$ip" "$port" &>/dev/null && return 0
+	elif command -v timeout &>/dev/null; then
+		timeout 3 bash -c ": >/dev/tcp/$ip/$port" 2>/dev/null && return 0
+	else
+		return 0
+	fi
+	return 1
 }
 
 # Какие SSH-порты реально слушаются (в _seen_ports — список через пробел).
