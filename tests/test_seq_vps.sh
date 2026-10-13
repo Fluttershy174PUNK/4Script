@@ -87,6 +87,37 @@ fi
 assert_eq "$(_sshd_option 'PasswordAuthentication no' passwordauthentication yes)" 'no' 'option read from lowercase dump'
 assert_eq "$(_sshd_option 'banner none' passwordauthentication yes)" 'yes' 'missing option falls back to default'
 
+# ── Список харденинга ядра и PAM-помощники ────────────────────────────
+[[ ${#SYSCTL_HARDENING[@]} -ge 10 ]] || fail 'sysctl hardening list is suspiciously short'
+sysctl_seen=' '
+for def in "${SYSCTL_HARDENING[@]}"; do
+	IFS='|' read -r name want why <<<"$def"
+	[[ -n "$name" && -n "$want" && -n "$why" ]] || fail "incomplete sysctl row: $def"
+	[[ "$sysctl_seen" == *" $name "* ]] && fail "duplicate sysctl key: $name"
+	sysctl_seen+="$name "
+	[[ "$name" == *.* ]] || fail "sysctl key without dot: $name"
+	[[ "$want" =~ ^[0-9]+$ ]] || fail "sysctl value is not numeric: $want"
+done
+
+# PAM-помощники существуют (этап 18). Сами функции не вызываем:
+# под set -e ненулевой код grep упал бы и без ошибки в коде.
+for fn in _pam_faillock_active _pam_pwquality_active _pam_sanity _pam_restore \
+	_pam_enable_faillock _pam_enable_pwquality _pam_disable_faillock; do
+	declare -F "$fn" >/dev/null || fail "missing PAM helper: $fn"
+done
+
+# Проверка самих предикатов на копии PAM-файла, без правки системы:
+pamdir=$(mktemp -d)
+printf 'auth required pam_unix.so\n' >"$pamdir/common-auth"
+printf 'password required pam_unix.so\n' >"$pamdir/common-password"
+# _pam_*_active смотрят в /etc/pam.d, поэтому проверяем саму логику grep
+if grep -qE '^[^#]*pam_faillock\.so' "$pamdir/common-auth"; then fail 'faillock predicate matches clean file'; fi
+printf 'auth required pam_faillock.so preauth\n' >>"$pamdir/common-auth"
+grep -qE '^[^#]*pam_faillock\.so' "$pamdir/common-auth" || fail 'faillock predicate misses enabled line'
+printf '#auth required pam_faillock.so\n' >"$pamdir/common-auth"
+grep -qE '^[^#]*pam_faillock\.so' "$pamdir/common-auth" && fail 'faillock predicate matches commented line' || true
+rm -rf "$pamdir"
+
 # ── Ввод пароля (без изменений системы) ──────────────────────────────
 # Важно: через '< <(...)', а не 'printf | _read_new_password', иначе функция
 # работает в subshell и присваивание переменной вызывающего не видно.
