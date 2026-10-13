@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# seq_vps.sh — Комплексная защита VPS сервера
+# 4script.sh — Комплексная защита VPS сервера
 # Debian/Ubuntu · Fedora/RHEL/CentOS · Rocky · AlmaLinux
 #
-# Использование: sudo ./seq_vps.sh [--help]
+# Использование: sudo ./4script.sh [--help]
 #
 
 # ponytail: без -e — это интерактивное меню, любой `return 1` из этапа
@@ -43,17 +43,31 @@ readonly SPINNER_CHARS='|/-\'
 # ═══════════════════════════════════════════════════════════════════
 #  ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 # ═══════════════════════════════════════════════════════════════════
-readonly DATA_DIR="/opt/seq_vps"
+# Каталог данных. Проект раньше назывался seq_vps: на уже настроенных серверах
+# остался /opt/seq_vps с бэкапами и статусом, и его надо продолжать использовать —
+# иначе потеряются все откаты. Новые установки идут в /opt/4script.
+_OLD_DATA_DIR="/opt/seq_vps"
+_NEW_DATA_DIR="/opt/4script"
+if [[ -d "$_OLD_DATA_DIR" ]]; then
+	readonly DATA_DIR="$_OLD_DATA_DIR"
+else
+	readonly DATA_DIR="$_NEW_DATA_DIR"
+fi
 # одна метка времени на прогон — иначе бэкап и лог могут разойтись на секунду
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 readonly RUN_TS
 readonly BACKUP_DIR="${DATA_DIR}/backups/${RUN_TS}"
-readonly LOG_FILE="${DATA_DIR}/seq_vps_${RUN_TS}.log"
+readonly LOG_FILE="${DATA_DIR}/4script_${RUN_TS}.log"
 readonly STAGE_STATUS_FILE="${DATA_DIR}/.seq_vps_status"
 readonly SSHD_CONFIG_D="/etc/ssh/sshd_config.d"
 # 00-, а не 99-: sshd берёт ПЕРВОЕ найденное значение, а на облачных образах
 # лежит 50-cloud-init.conf с PasswordAuthentication yes, который перебьёт 99-*.
 readonly SEQ_SSHD_DROPIN="00-seq-vps.conf"
+# Маркеры своих блоков в чужих конфигах (PAM, faillock, pwquality, sysctl).
+# Историческое имя оставлено намеренно: на настроенных серверах эти блоки уже
+# помечены seq_vps, и смена маркера заставила бы скрипт писать дубли.
+readonly OWN_MARK="# seq_vps"
+readonly OWN_MARK_PAM="seq_vps faillock"
 CURRENT_SSH_PORT=22
 # Порт, который надо закрыть в фаерволе после успешного рестарта SSH
 _wanted_close_port=""
@@ -345,7 +359,7 @@ detect_distro() {
 # Шаблон статус-файла в stdout: генератор отдельно от файла, чтобы можно было
 # проверять без root — STAGE_STATUS_FILE readonly.
 stage_status_template() {
-	echo "# Статус этапов seq_vps (completed / failed / skipped / not_started)"
+	echo "# Статус этапов 4script (completed / failed / skipped / not_started)"
 	local def num key
 	for def in "${STAGE_DEFS[@]}"; do
 		IFS='|' read -r num key _ _ _ _ <<<"$def"
@@ -371,7 +385,7 @@ init_status_file() {
 
 check_root() {
 	if [[ $EUID -ne 0 ]]; then
-		echo -e "${C_RED}${ICON_FAIL}  Запустите от root:  sudo ./seq_vps.sh${C_RESET}"
+		echo -e "${C_RED}${ICON_FAIL}  Запустите от root:  sudo ./4script.sh${C_RESET}"
 		exit 1
 	fi
 }
@@ -1176,7 +1190,7 @@ _ssh_socket_port() {
 	mkdir -p "$dir"
 	backup_file "$f" "stage5_ssh_config"
 	cat >"$f" <<EOF
-# seq_vps: порт сокет-активации
+# 4script: порт сокет-активации
 [Socket]
 ListenStream=
 ListenStream=$port
@@ -1192,7 +1206,7 @@ EOF
 		st="stage5_ssh_config"
 		backup_file "$pc" "$st"
 		# закомментировать, а не удалять: файл может принадлежать провайдеру
-		sed -i 's/^[[:space:]]*Port[[:space:]]/# seq_vps: отключено (порт перенесён в 00-seq-vps.conf): &/I' "$pc"
+		sed -i 's/^[[:space:]]*Port[[:space:]]/# 4script: отключено (порт перенесён в 00-seq-vps.conf): &/I' "$pc"
 		log_info "Порт в $f_base отключён (иначе слушался бы параллельно)"
 	done
 	shopt -u nullglob
@@ -1502,7 +1516,7 @@ stage_ssh_config() {
 		log_info "Старый drop-in 99-seq-vps.conf удалён (заменён на 00-)"
 	}
 	backup_file "$cfg" "stage5_ssh_config"
-	[[ ! -f "$cfg" ]] && echo "# seq_vps drop-in config" >"$cfg"
+	[[ ! -f "$cfg" ]] && echo "# 4script drop-in config" >"$cfg"
 
 	# Хелпер — пишет drop-in через буфер и валидирует ДО установки:
 	# невалидная правка (опечатка, системный лимит) не превратит живой конфиг в мёртвый.
@@ -1741,7 +1755,7 @@ stage_sftp_user() {
 	local new_cfg
 	new_cfg=$(mktemp)
 	cat >"$new_cfg" <<EOF
-# SFTP: $sfu (seq_vps)
+# SFTP: $sfu (4script)
 Match User $sfu
     ForceCommand internal-sftp
     ChrootDirectory $chroot_dir
@@ -2384,7 +2398,7 @@ _dns_apply() {
 		mkdir -p "$dir"
 		backup_file "$dir/10-seq-vps.conf" "stage10_dns"
 		{
-			echo "# seq_vps"
+			echo "# 4script"
 			echo "[Resolve]"
 			echo "DNS=$servers"
 		} >"$dir/10-seq-vps.conf"
@@ -2398,7 +2412,7 @@ _dns_apply() {
 	*)
 		backup_file "/etc/resolv.conf" "stage10_dns"
 		{
-			echo "# seq_vps"
+			echo "# 4script"
 			local s
 			for s in $servers; do echo "nameserver $s"; done
 		} >/etc/resolv.conf
@@ -2663,7 +2677,7 @@ stage_bbr() {
 		read -rp "  ${ICON_ARROW} " choice
 		if [[ "$choice" == "1" ]]; then
 			cat >/etc/sysctl.d/90-bbr.conf <<'EOF'
-# BBR отключён (seq_vps)
+# BBR отключён (4script)
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = cubic
 EOF
@@ -2686,7 +2700,7 @@ EOF
 			fi
 			backup_file "/etc/sysctl.d/90-bbr.conf" "stage15_bbr"
 			cat >/etc/sysctl.d/90-bbr.conf <<'EOF'
-# BBR congestion control (seq_vps)
+# BBR congestion control (4script)
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
@@ -2784,7 +2798,7 @@ stage_sysctl() {
 	# применении выставил 17 параметров, а при повторном прогоне остался один,
 	# и все остальные значения после перезагрузки откатились бы.
 	{
-		echo "# seq_vps: харденинг ядра (набор целиком, идемпотентно)"
+		echo "# 4script: харденинг ядра (набор целиком, идемпотентно)"
 		for def in "${SYSCTL_HARDENING[@]}"; do
 			IFS='|' read -r name want _ <<<"$def"
 			[[ -n "$(sysctl -n "$name" 2>/dev/null)" ]] || continue
@@ -3028,35 +3042,35 @@ _pam_enable_faillock() {
 		: >/etc/security/faillock.conf
 	fi
 	# правим только свои строки внутри файла
-	if grep -q '^# seq_vps' /etc/security/faillock.conf 2>/dev/null; then
-		sed -i '/^# seq_vps/,+3d' /etc/security/faillock.conf
+	if grep -q "^$OWN_MARK" /etc/security/faillock.conf 2>/dev/null; then
+		sed -i "/^$OWN_MARK/,+3d" /etc/security/faillock.conf
 	fi
 	{
-		echo "# seq_vps: блокировка после $deny неудач на $unlock сек"
+		echo "$OWN_MARK: блокировка после $deny неудач на $unlock сек"
 		echo "deny = $deny"
 		echo "unlock_time = $unlock"
-		echo "# seq_vps: конец блока"
+		echo "$OWN_MARK: конец блока"
 	} >>/etc/security/faillock.conf
 
 	# auth: preauth + authfail вокруг pam_unix
 	# account: счётчик ведётся при входе (строка preauth в account)
-	if ! grep -q 'seq_vps faillock preauth' /etc/pam.d/common-auth 2>/dev/null; then
+	if ! grep -q "$OWN_MARK_PAM preauth" /etc/pam.d/common-auth 2>/dev/null; then
 		local tmp
 		tmp=$(mktemp)
 		{
-			echo "# seq_vps faillock preauth (проверка блокировки до пароля)"
+			echo "$OWN_MARK faillock preauth (проверка блокировки до пароля)"
 			echo "auth	required			pam_faillock.so preauth"
-			echo "# seq_vps faillock authfail (счетчик неудач)"
+			echo "$OWN_MARK faillock authfail (счетчик неудач)"
 			echo "auth	[default=die]		pam_faillock.so authfail"
 		} >"$tmp"
 		cat /etc/pam.d/common-auth >>"$tmp"
 		mv "$tmp" /etc/pam.d/common-auth
 	fi
-	if ! grep -q 'seq_vps faillock account' /etc/pam.d/common-account 2>/dev/null; then
+	if ! grep -q "$OWN_MARK_PAM account" /etc/pam.d/common-account 2>/dev/null; then
 		local tmp
 		tmp=$(mktemp)
 		{
-			echo "# seq_vps faillock account (счётчик неудач при входе)"
+			echo "$OWN_MARK faillock account (счётчик неудач при входе)"
 			echo "account	required		pam_faillock.so"
 		} >"$tmp"
 		cat /etc/pam.d/common-account >>"$tmp"
@@ -3082,7 +3096,7 @@ _pam_disable_faillock() {
 	}
 	backup_file "/etc/pam.d/common-auth" "stage18_pam"
 	backup_file "/etc/pam.d/common-account" "stage18_pam"
-	sed -i '/pam_faillock\.so/d; /seq_vps faillock/d' /etc/pam.d/common-auth /etc/pam.d/common-account
+	sed -i "/pam_faillock\.so/d; /$OWN_MARK_PAM/d" /etc/pam.d/common-auth /etc/pam.d/common-account
 	log_ok "pam_faillock выключен (счётчики в /var/run/faillock можно удалить)"
 }
 
@@ -3103,7 +3117,7 @@ _pam_enable_pwquality() {
 		local tmp
 		tmp=$(mktemp)
 		{
-			echo "# seq_vps pwquality"
+			echo "$OWN_MARK pwquality"
 			echo "password	requisite		pam_pwquality.so retry=3"
 		} >"$tmp"
 		cat /etc/pam.d/common-password >>"$tmp"
@@ -3111,11 +3125,11 @@ _pam_enable_pwquality() {
 	fi
 
 	if [[ ! -f /etc/security/pwquality.conf ]]; then : >/etc/security/pwquality.conf; fi
-	if grep -q '^# seq_vps' /etc/security/pwquality.conf 2>/dev/null; then
-		sed -i '/^# seq_vps/,+5d' /etc/security/pwquality.conf
+	if grep -q "^$OWN_MARK" /etc/security/pwquality.conf 2>/dev/null; then
+		sed -i "/^$OWN_MARK/,+5d" /etc/security/pwquality.conf
 	fi
 	{
-		echo "# seq_vps: требования к паролям"
+		echo "$OWN_MARK: требования к паролям"
 		echo "minlen = 12"
 		echo "dcredit = -1"
 		echo "ucredit = -1"
@@ -3189,7 +3203,7 @@ stage_auditd() {
 	local cur_rules
 	cur_rules=$(auditctl -l 2>/dev/null | grep -c . || true)
 	echo -e "  ${C_DIM}активных правил сейчас: ${cur_rules:-0}${C_RESET}"
-	[[ -f "$rules" ]] && echo -e "  ${C_DIM}файл seq_vps: есть${C_RESET}" || echo -e "  ${C_DIM}файл seq_vps: нет${C_RESET}"
+	[[ -f "$rules" ]] && echo -e "  ${C_DIM}файл 4script: есть${C_RESET}" || echo -e "  ${C_DIM}файл 4script: нет${C_RESET}"
 
 	echo ""
 	echo -e "  ${C_BOLD}Правила, которые будут добавлены:${C_RESET}"
@@ -3207,7 +3221,7 @@ stage_auditd() {
 
 	backup_file "$rules" "stage19_auditd"
 	cat >"$rules" <<'EOF'
-# seq_vps: базовый аудит — ключевые файлы, root-команды, модули ядра
+# 4script: базовый аудит — ключевые файлы, root-команды, модули ядра
 # Просмотр: ausearch -k <ключ>   |   aureport --summary
 
 # Идентификация и полномочия
@@ -3515,8 +3529,8 @@ show_help() {
 	echo "  Поддерживает: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux."
 	echo ""
 	echo "  Использование:"
-	echo "    sudo ./seq_vps.sh          — интерактивное меню"
-	echo "    sudo ./seq_vps.sh --help   — эта справка"
+	echo "    sudo ./4script.sh          — интерактивное меню"
+	echo "    sudo ./4script.sh --help   — эта справка"
 	echo ""
 	echo "  Этапы:"
 	local def num key icon title cat fn c
@@ -3530,7 +3544,7 @@ show_help() {
 	done
 	echo "     R. Откат этапа из бэкапа"
 	echo ""
-	echo "  Данные: /opt/seq_vps/"
+	echo "  Данные: $DATA_DIR/  (на обновлённых серверах сохраняется старый /opt/seq_vps/)"
 	echo ""
 	exit 0
 }

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Статические и юнит-проверки без root и без изменений системы.
-# Сеть не используется; запуск: bash tests/test_seq_vps.sh
+# Сеть не используется; запуск: bash tests/test_4script.sh
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-# shellcheck source=../seq_vps.sh
-source "$ROOT/seq_vps.sh"
+# shellcheck source=../4script.sh
+source "$ROOT/4script.sh"
 set -euo pipefail
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
@@ -143,7 +143,7 @@ printf 'n\n' | confirm 'Test?' >/dev/null && fail 'line-based confirmation rejec
 # аргументов и при EOF не должна ронять скрипт (неважно, что код возврата).
 show_server_summary </dev/null >/dev/null 2>&1 || fail 'show_server_summary falls over'
 show_stage_help </dev/null >/dev/null 2>&1 || true
-grep -q 'repeat_hdr "\$ICON' seq_vps.sh || repeat_hdr "$ICON_BULLET" "T" >/dev/null || fail 'repeat_hdr with explicit args fails'
+grep -q 'repeat_hdr "\$ICON' 4script.sh || repeat_hdr "$ICON_BULLET" "T" >/dev/null || fail 'repeat_hdr with explicit args fails'
 repeat_hdr "$ICON_BULLET" "T" >/dev/null || fail 'repeat_hdr with explicit args fails'
 category_icon setup >/dev/null || fail 'category_icon fails'
 category_color access >/dev/null || fail 'category_color fails'
@@ -157,8 +157,8 @@ done
 for c in "${CATEGORY_ORDER[@]}"; do
 	declare -F category_color >/dev/null || fail 'category_color missing'
 done
-grep -qA6 '^category_color()' seq_vps.sh || fail 'category_color lost its case block'
-[[ "$(grep -c 'C_YELLOW\|C_GREEN\|C_CYAN' <(sed -n '/^category_color/,/^}/p' seq_vps.sh))" -ge 3 ]] ||
+grep -qA6 '^category_color()' 4script.sh || fail 'category_color lost its case block'
+[[ "$(grep -c 'C_YELLOW\|C_GREEN\|C_CYAN' <(sed -n '/^category_color/,/^}/p' 4script.sh))" -ge 3 ]] ||
 	fail 'category_color no longer maps categories to colors'
 
 show_server_summary() { :; }
@@ -167,4 +167,4 @@ get_stage_status() { echo not_started; }
 log_info() { :; }
 if (main_menu </dev/null >/dev/null); then :; else fail 'EOF-safe menu exits cleanly'; fi
 
-printf 'OK: seq_vps unit checks passed\n'
+printf 'OK: 4script unit checks passed\n'
