@@ -76,6 +76,10 @@ Stages are grouped by what they affect. Status marks in the menu come from
 | 13 | Lynis | security audit, hardening index |
 | 14 | Disk | usage, large files |
 | 15 | BBR | TCP congestion control |
+| 16 | Kernel hardening | sysctl: KASLR/dmesg/core dumps, hardlink/symlink guards, ICMP redirects and source routing, rp_filter, SYN cookies |
+| 17 | Audit | listen ports, accounts (UID 0, no password, sudo), SUID/SGID, world-writable files, LSM state, FIM tools (read-only) |
+| 18 | Passwords and lockout | `pam_faillock` (locks the account, not the address) and `pam_pwquality` |
+| 19 | Event audit | `auditd` with baseline rules: identity files, `sudoers`, SSH config, root commands, kernel modules |
 | R | Rollback | restore a stage from its backup |
 | H | Help | stage list and recommended order |
 | Q | Quit | |
@@ -269,8 +273,22 @@ shellcheck -S warning seq_vps.sh tests/test_seq_vps.sh
 ```
 
 They cover the stage registry (unique numbers/keys, every function exists,
-every stage function is listed), status-file generation, sshd directive
-parsing, the password prompt, the progress bar and non-TTY behaviour.
+every stage function is listed), status-file migration for new stages, sshd
+directive parsing, the password prompt, UTF-8 safe truncation, the sysctl
+hardening list and the PAM predicates, plus the progress bar, the help screen
+and non-TTY behaviour.
+
+### Tested on a live stand
+
+Everything above plus the risky paths were exercised on **Ubuntu 26.04 LTS /
+OpenSSH 10.2 in a container** (CT205): the tests, SSH port changes with socket
+activation, firewall rules for the new and old port, DNS, PAM (`pam_faillock`
+on and off, login verified in a separate session), sysctl hardening and the
+read-only audit stage.
+
+Two findings worth naming: LXC blocks some sysctl keys and cannot run `auditd`
+(no `cap_sys_nice`) — the script now reports exactly that instead of claiming
+success, and keys the kernel refuses are listed as not applied.
 
 ### TUI: stability over effects
 
