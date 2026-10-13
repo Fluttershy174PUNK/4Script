@@ -110,6 +110,7 @@ readonly STAGE_DEFS=(
 	"17|stage17_audit|🔎|Аудит: порты, учётки, SUID, LSM|system|stage_audit"
 	"18|stage18_pam|🔐|Пароли и блокировки (PAM)|protect|stage_pam"
 	"19|stage19_auditd|📋|Аудит событий (auditd)|protect|stage_auditd"
+	"20|stage20_ipv6|🌐|IPv6: включить или отключить|protect|stage_ipv6"
 )
 readonly CATEGORY_ORDER=(setup access protect system)
 
@@ -3315,6 +3316,175 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 20: IPv6 — ВКЛЮЧИТЬ ИЛИ ОТКЛЮЧИТЬ
+# ═══════════════════════════════════════════════════════════════════
+
+# IPv6 не нужен на сервере без AAAA-записи, но его наличие расширяет
+# поверхность атаки и ломает часть правил фаервола, если тот настроен
+# только для IPv4. Отключение делается через sysctl (переживает перезагрузку)
+# и, где есть GRUB, через параметр ядра — sysctl достаточно на практике.
+_ipv6_conf() { printf '%s' "/etc/sysctl.d/98-4script-ipv6.conf"; }
+
+_ipv6_disabled_now() {
+	[[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == "1" ]]
+}
+
+# Считает адреса и слушающие IPv6-сокеты — это то, что реально видно снаружи
+_ipv6_state() {
+	_ipv6_addrs=$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6' || true)
+	_ipv6_listen=$(ss -tln 2>/dev/null | grep -c '\[::\]' || true)
+	_ipv6_conn=$(ss -tn 2>/dev/null | grep -cE '\[::[0-9a-f:]*\]:' || true)
+}
+
+# Живые интерфейсы с поддержкой IPv6. Исключаем all/default и транзитные
+# записи вида eth0@if5; точки в именах (eth0.100) допустимы.
+_ipv6_live_ifaces() {
+	local f name
+	for f in /proc/sys/net/ipv6/conf/*; do
+		[[ -d "$f" ]] || continue
+		name=$(basename "$f")
+		case "$name" in
+		all | default | *@*) continue ;;
+		esac
+		printf '%s\n' "$name"
+	done
+}
+
+# Активная сессия по IPv6 — отключение IPv6 оборвёт её насмерть
+# (человек потеряет доступ и вернётся только через консоль провайдера).
+_ipv6_session_risk() {
+	local conn="${SSH_CONNECTION:-}"
+	[[ -n "$conn" ]] || return 1
+	[[ "${conn%% *}" == *:* ]]
+}
+
+stage_ipv6() {
+	stage_banner "$ICON_GLOBE" "20" "IPv6: включить или отключить"
+
+	local cur
+	cur=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+	_ipv6_state
+
+	echo -e "${C_BOLD}▸ Сейчас:${C_RESET}"
+	if _ipv6_disabled_now; then
+		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  IPv6: отключён (net.ipv6.conf.all.disable_ipv6=$cur)"
+	else
+		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  IPv6: включён"
+	fi
+	echo -e "  глобальных адресов: $_ipv6_addrs   слушающих IPv6-сокетов: $_ipv6_listen"
+	[[ -f "$(_ipv6_conf)" ]] && echo -e "  ${C_DIM}файл 4script: $(_ipv6_conf)${C_RESET}" || echo -e "  ${C_DIM}файл 4script: нет${C_RESET}"
+
+	if _ipv6_session_risk; then
+		echo ""
+		log_warn "Текущая SSH-сессия идёт по IPv6 (${SSH_CONNECTION%% *})"
+		log_warn "Отключение IPv6 оборвёт её немедленно — доступ понадобится восстанавливать из консоли"
+	fi
+
+	echo ""
+	echo "  1) Отключить IPv6"
+	echo "  2) Включить IPv6"
+	echo "  S) Назад"
+	read -rp "  ${ICON_ARROW} " choice
+
+	case "$choice" in
+	1) _ipv6_disable ;;
+	2) _ipv6_enable ;;
+	*) log_info "Пропущено" ;;
+	esac
+
+	update_stage_status "stage20_ipv6" "completed"
+}
+
+_ipv6_disable() {
+	local conf
+	conf=$(_ipv6_conf)
+
+	if _ipv6_disabled_now; then
+		log_info "IPv6 уже отключён"
+		return 0
+	fi
+
+	# Предупреждения о том, что именно сломается
+	echo ""
+	log_warn "Отключение IPv6 влияет на:"
+	echo "    - сервисы, слушающие только [::] (ss показывает такие сокеты выше)"
+	echo "    - правила фаервола, привязанные к IPv6-адресам"
+	echo "    - клиенты, ходящие на ваш AAAA-адрес, если он у вас есть"
+	echo ""
+	if _ipv6_session_risk; then
+		log_err "ВНИМАНИЕ: ты в сессии по IPv6 — отключение разорвёт соединение"
+	fi
+	confirm "Отключить IPv6 на этом сервере?" || {
+		log_info "Отменено"
+		return 0
+	}
+
+	backup_file "$conf" "stage20_ipv6"
+	# all + default покрывают будущие интерфейсы; disable_ipv6 по интерфейсам
+	# ставить не нужно — достаточно этих двух (ядро применяет к новым)
+	cat >"$conf" <<'EOF'
+# 4script: IPv6 отключён
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+
+	sysctl -q -p "$conf" 2>/dev/null || sysctl -q -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
+
+	# Живые интерфейсы не сбрасывают адреса сами: применяем принудительно,
+	# иначе до перезагрузки IPv6 продолжит работать через уже настроенные адреса
+	local iface
+	while read -r iface; do
+		[[ -n "$iface" ]] || continue
+		sysctl -q -w "net.ipv6.conf.$iface.disable_ipv6=1" 2>/dev/null || true
+	done < <(_ipv6_live_ifaces)
+
+	sleep 1
+	_ipv6_state
+	if _ipv6_disabled_now && [[ "${_ipv6_addrs:-0}" -eq 0 ]]; then
+		log_ok "IPv6 отключён (адресов: 0, слушающих IPv6-сокетов: ${_ipv6_listen:-0})"
+		[[ "${_ipv6_listen:-0}" -gt 0 ]] && log_warn "Некоторые сервисы ещё держат IPv6-сокеты — они закроются после их перезапуска"
+	else
+		log_warn "Не всё применилось: disable_ipv6=$(sysctl -n net.ipv6.conf.all.disable_ipv6), адресов $_ipv6_addrs"
+		log_info "Перезагрузка доведёт состояние до нужного"
+	fi
+}
+
+_ipv6_enable() {
+	local conf
+	conf=$(_ipv6_conf)
+
+	if ! _ipv6_disabled_now; then
+		log_info "IPv6 уже включён"
+		return 0
+	fi
+
+	backup_file "$conf" "stage20_ipv6"
+
+	# Убираем свои строки и файл целиком: иначе после файл с disable_ipv6=1
+	# применится снова при следующей загрузке
+	if [[ -f "$conf" ]]; then
+		rm -f "$conf"
+		log_info "Файл $conf удалён"
+	fi
+
+	sysctl -q -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 2>/dev/null || true
+	local iface
+	while read -r iface; do
+		[[ -n "$iface" ]] || continue
+		sysctl -q -w "net.ipv6.conf.$iface.disable_ipv6=0" 2>/dev/null || true
+	done < <(_ipv6_live_ifaces)
+
+	sleep 1
+	_ipv6_state
+	if ! _ipv6_disabled_now; then
+		log_ok "IPv6 включён (глобальных адресов: ${_ipv6_addrs:-0})"
+		[[ "${_ipv6_addrs:-0}" -eq 0 ]] && log_info "Адреса появятся по SLAAC/DHCPv6 или из конфигурации провайдера"
+	else
+		log_err "Не удалось включить IPv6 (disable_ipv6=$(sysctl -n net.ipv6.conf.all.disable_ipv6))"
+	fi
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  ЭТАП R: ОТКАТ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -3394,6 +3564,9 @@ stage_rollback() {
 		stage10_dns) op="/etc/resolv.conf" ;;
 		stage16_sysctl)
 			[[ "$bn" == "99-seq-vps.conf" ]] && op="/etc/sysctl.d/99-seq-vps.conf"
+			;;
+		stage20_ipv6)
+			[[ "$bn" == "98-4script-ipv6.conf" ]] && op="/etc/sysctl.d/98-4script-ipv6.conf"
 			;;
 		esac
 		[[ -n "$op" ]] && {
