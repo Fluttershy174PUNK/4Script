@@ -4073,14 +4073,18 @@ remote_start_server_run() {
 		mux=tmux
 	fi
 
+	# LC_ALL=C.UTF-8 и screen -U обязательны: по неинтерактивному ssh локаль
+	# пустая, screen считает терминал 8-битным и перекодирует многобайтные
+	# символы (рамки, блоки прогресса, галочки) в мусор. Проверено замерами:
+	# без -U в каждом прогоне 2 битых байта, с -U — ноль.
+	local env_prefix="LC_ALL=C.UTF-8 LANG=C.UTF-8"
 	if [[ "$mux" == screen ]]; then
 		log_info "Запускаю внутри screen (сессия $REMOTE_SESSION) — обрыв связи не прервёт настройку"
-		# -d -m: сразу в фоне; остающийся pty даёт меню нормальный терминал
-		remote_run_remote "screen -dmS $REMOTE_SESSION bash -c 'cd /tmp && exec bash ./4script.sh'" || return 1
+		remote_run_remote "$env_prefix screen -U -dmS $REMOTE_SESSION bash -c 'cd /tmp && exec bash ./4script.sh'" || return 1
 		return 0
 	elif [[ "$mux" == tmux ]]; then
 		log_info "Запускаю внутри tmux (сессия $REMOTE_SESSION)"
-		remote_run_remote "tmux new-session -d -s $REMOTE_SESSION 'cd /tmp && bash ./4script.sh'" || return 1
+		remote_run_remote "$env_prefix tmux new-session -d -s $REMOTE_SESSION 'cd /tmp && bash ./4script.sh'" || return 1
 		return 0
 	fi
 	return 1
@@ -4111,15 +4115,16 @@ remote_attach() {
 
 	case "$mux" in
 	screen)
-		# -t обязателен: меню требует терминал
+		# -t обязателен: меню требует терминал. Локаль и -U — по той же причине,
+		# что при запуске: иначе кириллица и рамки приходят битыми.
 		log_info "Подключаюсь к screen-сессии $REMOTE_SESSION (отключиться — Ctrl-A d, выйти — Q в меню)"
 		# shellcheck disable=SC2029
-		ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" "screen -r $REMOTE_SESSION"
+		ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" "LC_ALL=C.UTF-8 LANG=C.UTF-8 screen -U -r $REMOTE_SESSION"
 		;;
 	tmux)
 		log_info "Подключаюсь к tmux-сессии $REMOTE_SESSION (отключиться — Ctrl-B d)"
 		# shellcheck disable=SC2029
-		ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" "tmux attach -t $REMOTE_SESSION"
+		ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" "LC_ALL=C.UTF-8 LANG=C.UTF-8 tmux attach -t $REMOTE_SESSION"
 		;;
 	*)
 		log_err "На сервере нет screen и tmux — подключиться к фоновой сессии нечем"
