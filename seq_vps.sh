@@ -65,6 +65,66 @@ SSH_SERVICE=""
 SUDO_GROUP=""
 HAS_SELINUX=false
 
+readonly SCRIPT_VERSION="1.1"
+
+# ═══════════════════════════════════════════════════════════════════
+#  РЕЕСТР ЭТАПОВ — единственный источник правды для меню, прогресса,
+#  справки, шаблона статус-файла и диспетчера выбора.
+#    номер|ключ статуса|иконка|название|категория|функция
+#  Пустой ключ = этап без статуса (утилиты).
+# ═══════════════════════════════════════════════════════════════════
+readonly STAGE_DEFS=(
+	"0||${ICON_GEAR}|Установка утилит (micro, mc)|setup|stage_utilities"
+	"1|stage1_update|${ICON_GEAR}|Обновление системы|setup|stage_update"
+	"2|stage2_admin_user|${ICON_USER}|Управление пользователями|access|stage_users"
+	"3|stage3_root_password|${ICON_KEY}|Изменение пароля root|access|stage_root_password"
+	"4|stage4_ssh_key|${ICON_KEY}|Установка SSH-ключа|access|stage_ssh_key"
+	"5|stage5_ssh_config|${ICON_KEY}|Настройка SSH (порт, вход, root)|access|stage_ssh_config"
+	"6|stage6_sftp_user|${ICON_LOCK}|Создание SFTP пользователя|access|stage_sftp_user"
+	"7|stage7_ufw|${ICON_FIRE}|Фаервол (UFW / firewalld)|protect|stage_ufw"
+	"8|stage8_autoupdate|${ICON_GEAR}|Автообновления безопасности|protect|stage_autoupdate"
+	"9|stage9_intrusion|${ICON_SHIELD}|Защита от брутфорса (CrowdSec/Fail2Ban)|protect|stage_intrusion"
+	"10|stage10_dns|${ICON_GLOBE}|Настройка DNS|protect|stage_dns"
+	"11|stage11_fish|🐟|Установка Fish shell|system|stage_fish"
+	"12|stage12_timezone|🕐|Часовой пояс и синхронизация времени|system|stage_timezone"
+	"13|stage13_lynis|🔍|Аудит безопасности (Lynis)|system|stage_lynis"
+	"14|stage14_disk|💾|Мониторинг диска и большие файлы|system|stage_disk"
+	"15|stage15_bbr|🚀|BBR congestion control|system|stage_bbr"
+)
+readonly CATEGORY_ORDER=(setup access protect system)
+
+category_title() {
+	case "$1" in
+	setup) echo "Подготовка" ;;
+	access) echo "Доступ и вход" ;;
+	protect) echo "Защита" ;;
+	system) echo "Система и сеть" ;;
+	*) echo "$1" ;;
+	esac
+}
+
+# Запись реестра по номеру либо ключу этапа: stage_def <0|stage1_update>
+stage_def() {
+	local def num key
+	for def in "${STAGE_DEFS[@]}"; do
+		IFS='|' read -r num key _ _ _ _ <<<"$def"
+		[[ "$num" == "$1" || ( -n "$1" && "$key" == "$1" ) ]] && {
+			printf '%s' "$def"
+			return 0
+		}
+	done
+	return 1
+}
+
+# Запуск этапа по его номеру (диспетчер меню)
+run_stage() {
+	local def fn
+	def=$(stage_def "$1") || return 1
+	fn=$(cut -d'|' -f6 <<<"$def")
+	[[ -n "$fn" ]] || return 1
+	"$fn"
+}
+
 # ═══════════════════════════════════════════════════════════════════
 #  БАЗОВЫЕ УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════════════
@@ -117,7 +177,14 @@ progress_bar() {
 	printf "${C_RESET}] %3d%%" "$pct"
 }
 
-log() { echo -e "$*" | tee -a "$LOG_FILE"; }
+# tee падает, если каталога/лога нет (например при source в тестах) — тогда только stdout
+log() {
+	if [[ -w "$LOG_FILE" || -w "${LOG_FILE%/*}" ]]; then
+		echo -e "$*" | tee -a "$LOG_FILE"
+	else
+		echo -e "$*"
+	fi
+}
 log_info() { log "${C_BLUE}${ICON_INFO}${C_RESET} $1"; }
 log_ok() { log "${C_GREEN}${ICON_OK}${C_RESET} $1"; }
 log_warn() { log "${C_YELLOW}${ICON_WARN}${C_RESET} $1"; }
@@ -133,6 +200,34 @@ hr_thick() {
 	local line
 	printf -v line '%*s' "$TERM_WIDTH" ''
 	printf "${C_BLUE}%s${C_RESET}\n" "${line// /═}"
+}
+
+# Заголовок раздела в меню — ширина не зависит от эмодзи
+repeat_hdr() {
+	local icon="$1" title="$2" color="${3:-$C_CYAN}"
+	local text="${icon}  ${title}" pad line
+	pad=$((TERM_WIDTH - ${#text} - 4))
+	((pad < 1)) && pad=1
+	printf -v line '%*s' "$pad" ''
+	printf "${C_BOLD}${color}├─ %s %s${C_RESET}\n" "$text" "${line// /─}"
+}
+
+category_icon() {
+	case "$1" in
+	setup) echo "$ICON_GEAR" ;;
+	access) echo "$ICON_USER" ;;
+	protect) echo "$ICON_SHIELD" ;;
+	system) echo "$ICON_GEAR" ;;
+	*) echo "$ICON_BULLET" ;;
+	esac
+}
+
+category_color() {
+	case "$1" in
+	access) echo "$C_YELLOW" ;;
+	protect) echo "$C_GREEN" ;;
+	*) echo "$C_CYAN" ;;
+	esac
 }
 
 # Заголовок этапа с иконкой
@@ -189,7 +284,7 @@ menu_item() {
 	else
 		num_fmt="${C_DIM}$(printf '%-3s' "${num})")${C_RESET}"
 	fi
-	printf "  %b %b%-50s%b\n" "$num_fmt" "$mark" "$text" "$color"
+	printf "  %b %b%-50s%b\n" "$num_fmt" "$mark" "${text:0:46}" "$color"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -235,26 +330,15 @@ detect_distro() {
 }
 
 init_status_file() {
-	if [[ ! -f "$STAGE_STATUS_FILE" ]]; then
-		cat >"$STAGE_STATUS_FILE" <<'EOF'
-# Статус этапов seq_vps (completed / failed / skipped / not_started)
-stage1_update=not_started
-stage2_admin_user=not_started
-stage3_root_password=not_started
-stage4_ssh_key=not_started
-stage5_ssh_config=not_started
-stage6_sftp_user=not_started
-stage7_ufw=not_started
-stage8_autoupdate=not_started
-stage9_intrusion=not_started
-stage10_dns=not_started
-stage11_fish=not_started
-stage12_timezone=not_started
-stage13_lynis=not_started
-stage14_disk=not_started
-stage15_bbr=not_started
-EOF
-	fi
+	[[ -f "$STAGE_STATUS_FILE" ]] && return 0
+	{
+		echo "# Статус этапов seq_vps (completed / failed / skipped / not_started)"
+		local def num key
+		for def in "${STAGE_DEFS[@]}"; do
+			IFS='|' read -r num key _ _ _ _ <<<"$def"
+			[[ -n "$key" ]] && echo "$key=not_started"
+			done
+	} >"$STAGE_STATUS_FILE"
 }
 
 check_root() {
@@ -290,6 +374,41 @@ get_stage_status() {
 	[[ -f "$STAGE_STATUS_FILE" ]] && grep "^${stage}=" "$STAGE_STATUS_FILE" 2>/dev/null | cut -d= -f2 || echo "not_started"
 }
 
+# Порт sshd одним способом: Port из эффективного конфига, иначе 22.
+# Заодно обновляет CURRENT_SSH_PORT — он используется в подсказках и проверках.
+_ssh_port() {
+	local cfg
+	cfg=$(sshd -T 2>/dev/null) || cfg=""
+	CURRENT_SSH_PORT=$(ssh_port_from_config "$cfg")
+	CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
+	printf '%s' "$CURRENT_SSH_PORT"
+}
+
+# Значение директивы из вывода sshd -T (имена там в нижнем регистре): _sshd_option "<дамп>" name default
+_sshd_option() {
+	local v
+	v=$(awk -v k="$2" 'tolower($1) == k { print $2; exit }' <<<"$1")
+	printf '%s' "${v:-$3}"
+}
+
+# Двойной ввод пароля с проверкой. Пароль возвращается в переменную с именем $1.
+_read_new_password() {
+	local var="$1" label="${2:-Пароль}" pw pw2
+	read -rsp "  ${label}: " pw
+	echo
+	read -rsp "  Подтвердите: " pw2
+	echo
+	[[ "$pw" == "$pw2" ]] || {
+		log_err "Пароли не совпадают"
+		return 1
+	}
+	[[ -n "$pw" ]] || {
+		log_err "Пароль не может быть пустым"
+		return 1
+	}
+	printf -v "$var" '%s' "$pw"
+}
+
 get_regular_users() {
 	while IFS=: read -r user _ uid _ _ home shell; do
 		[[ $uid -ge 1000 ]] || continue
@@ -318,7 +437,6 @@ ssh_port_from_config() {
 }
 
 show_server_summary() {
-	local w=$((TERM_WIDTH - 2))
 	echo -e "${C_BOLD}${C_CYAN}┌─${C_RESET} ${C_BOLD}СВОДКА СЕРВЕРА${C_RESET} ${C_DIM}— Seq VPS Security${C_RESET}"
 
 	# ── Пользователи ──
@@ -348,21 +466,15 @@ show_server_summary() {
 	local ssh_cfg
 	ssh_cfg=$(sshd -T 2>/dev/null || true) || true
 	local sp
-	sp=$(ssh_port_from_config "$ssh_cfg")
-	sp=${sp:-22}
-	CURRENT_SSH_PORT=$sp
+	sp=$(_ssh_port)
 	local pa
-	pa=$(echo "$ssh_cfg" | grep "^passwordauthentication " | awk '{print $2}')
-	pa=${pa:-yes}
+	pa=$(_sshd_option "$ssh_cfg" passwordauthentication yes)
 	local rl
-	rl=$(echo "$ssh_cfg" | grep "^permitrootlogin " | awk '{print $2}')
-	rl=${rl:-yes}
+	rl=$(_sshd_option "$ssh_cfg" permitrootlogin yes)
 	local ma
-	ma=$(echo "$ssh_cfg" | grep "^maxauthtries " | awk '{print $2}')
-	ma=${ma:-6}
+	ma=$(_sshd_option "$ssh_cfg" maxauthtries 6)
 	local ep
-	ep=$(echo "$ssh_cfg" | grep "^permitemptypasswords " | awk '{print $2}')
-	ep=${ep:-no}
+	ep=$(_sshd_option "$ssh_cfg" permitemptypasswords no)
 
 	# Определяем цвета для каждого параметра
 	local sc_port sc_pwd sc_root sc_empty
@@ -637,23 +749,12 @@ stage_users() {
 			log_err "Уже существует: $username"
 			return 1
 		}
-		read -rsp "  Пароль: " pw
-		echo
-		read -rsp "  Подтвердите: " pw2
-		echo
-		[[ "$pw" != "$pw2" ]] && {
-			log_err "Пароли не совпадают"
-			return 1
-		}
-		[[ -z "$pw" ]] && {
-			log_err "Пароль не может быть пустым"
-			return 1
-		}
+		local pw
+		_read_new_password pw || return 1
 		useradd -m -s /bin/bash "$username"
 		echo "$username:$pw" | chpasswd
 		usermod -aG "$SUDO_GROUP" "$username"
 		log_ok "Пользователь ${C_BOLD}$username${C_RESET} создан (группа $SUDO_GROUP)"
-		echo "ADMIN_USER=$username" >>"$STAGE_STATUS_FILE"
 		;;
 	p)
 		[[ ${#users[@]} -eq 0 ]] && {
@@ -666,14 +767,8 @@ stage_users() {
 			return 1
 		}
 		local u="${users[$((num - 1))]}"
-		read -rsp "  Новый пароль для ${C_BOLD}$u${C_RESET}: " pw
-		echo
-		read -rsp "  Подтвердите: " pw2
-		echo
-		[[ "$pw" != "$pw2" ]] && {
-			log_err "Пароли не совпадают"
-			return 1
-		}
+		local pw
+		_read_new_password pw "Новый пароль для $u" || return 1
 		echo "$u:$pw" | chpasswd
 		log_ok "Пароль ${C_BOLD}$u${C_RESET} изменён"
 		;;
@@ -760,17 +855,9 @@ stage_users() {
 
 stage_root_password() {
 	stage_banner "$ICON_KEY" "3" "Изменение пароля root"
-	read -rsp "  Новый пароль root: " pw
-	echo
-	read -rsp "  Подтвердите:     " pw2
-	echo
-	[[ "$pw" != "$pw2" ]] && {
-		log_err "Пароли не совпадают"
+	local pw
+	_read_new_password pw "Новый пароль root" || {
 		update_stage_status "stage3_root_password" "failed"
-		return 1
-	}
-	[[ -z "$pw" ]] && {
-		log_err "Пароль не может быть пустым"
 		return 1
 	}
 	echo "root:$pw" | chpasswd
@@ -1038,22 +1125,15 @@ stage_ssh_config() {
 	local sc
 	sc=$(sshd -T 2>/dev/null)
 	local sp
-	sp=$(ssh_port_from_config "$sc")
-	sp=${sp:-22}
-	# обновляем глобальный порт уже ПОСЛЕ того, как sp определён
-	CURRENT_SSH_PORT=$sp
+	sp=$(_ssh_port)
 	local pa
-	pa=$(echo "$sc" | grep "^passwordauthentication " | awk '{print $2}')
-	pa=${pa:-yes}
+	pa=$(_sshd_option "$sc" passwordauthentication yes)
 	local rl
-	rl=$(echo "$sc" | grep "^permitrootlogin " | awk '{print $2}')
-	rl=${rl:-yes}
+	rl=$(_sshd_option "$sc" permitrootlogin yes)
 	local ma
-	ma=$(echo "$sc" | grep "^maxauthtries " | awk '{print $2}')
-	ma=${ma:-6}
+	ma=$(_sshd_option "$sc" maxauthtries 6)
 	local ep
-	ep=$(echo "$sc" | grep "^permitemptypasswords " | awk '{print $2}')
-	ep=${ep:-no}
+	ep=$(_sshd_option "$sc" permitemptypasswords no)
 
 	local sc_port sc_pwd sc_root sc_empty
 	[[ "$sp" == "22" ]] && sc_port="$C_YELLOW" || sc_port="$C_GREEN"
@@ -1178,20 +1258,11 @@ stage_sftp_user() {
 		update_stage_status "stage6_sftp_user" "failed"
 		return 1
 	}
-	read -rsp "  Пароль: " sfpw
-	echo
-	read -rsp "  Подтвердите: " sfpw2
-	echo
-	[[ "$sfpw" != "$sfpw2" ]] && {
-		log_err "Пароли не совпадают"
+	local sfpw
+	_read_new_password sfpw || {
 		update_stage_status "stage6_sftp_user" "failed"
 		return 1
 	}
-	[[ -z "$sfpw" ]] && {
-		log_err "Пароль не может быть пустым"
-		return 1
-	}
-
 	local chroot_dir="/srv/sftp/$sfu"
 	local nologin_shell
 	nologin_shell=$(command -v nologin || echo /usr/sbin/nologin)
@@ -1303,8 +1374,7 @@ _firewalld_menu() {
 	systemctl enable --now firewalld 2>/dev/null
 
 	local sp
-	sp=$(sshd -T 2>/dev/null | grep "^port " | awk '{print $2}' | head -1)
-	sp=${sp:-22}
+	sp=$(_ssh_port)
 
 	while true; do
 		echo ""
@@ -1406,8 +1476,7 @@ stage_ufw() {
 	backup_file "/etc/ufw/ufw.conf" "stage7_ufw"
 
 	local sp
-	sp=$(sshd -T 2>/dev/null | grep "^port " | awk '{print $2}' | head -1)
-	sp=${sp:-22}
+	sp=$(_ssh_port)
 
 	while true; do
 		echo ""
@@ -1708,8 +1777,7 @@ _install_fail2ban() {
 	local f2b_jail="/etc/fail2ban/jail.local"
 	backup_file "$f2b_jail" "stage9_intrusion"
 	local sp
-	sp=$(sshd -T 2>/dev/null | grep "^port " | awk '{print $2}' | head -1)
-	sp=${sp:-22}
+	sp=$(_ssh_port)
 
 	# на firewalld-системах iptables-banaction конфликтует — банить через firewalld+ipset
 	local banaction=""
@@ -1926,14 +1994,11 @@ stage_disk() {
 	df -h --type=ext4 --type=xfs --type=btrfs 2>/dev/null || df -h 2>/dev/null | head -20
 	echo ""
 
-	# Проверка на >80%
-	local _critical=false
 	while IFS=' ' read -r _fs _size _used _avail pct mount; do
 		[[ "$pct" =~ ^[0-9]+%$ ]] || continue
 		local pct_n=${pct%\%}
 		if [[ $pct_n -ge 90 ]]; then
 			echo -e "  ${C_RED}${ICON_WARN}  КРИТИЧЕСКИ: $mount заполнен на $pct${C_RESET}"
-			_critical=true
 		elif [[ $pct_n -ge 80 ]]; then
 			echo -e "  ${C_YELLOW}${ICON_WARN}  $mount заполнен на $pct${C_RESET}"
 		else
@@ -2053,31 +2118,26 @@ EOF
 stage_rollback() {
 	stage_banner "↩" "R" "Откат этапа"
 
-	echo "  1) Обновление          9) Защита (CrowdSec/F2B)"
-	echo "  2) Пользователи       10) DNS"
-	echo "  3) Пароль root        11) Fish shell"
-	echo "  4) SSH-ключ           12) Часовой пояс"
-	echo "  5) SSH-конфиг         13) Lynis аудит"
-	echo "  6) SFTP               14) Мониторинг диска"
-	echo "  7) UFW                15) BBR"
-	echo "  8) Автообновления"
+	# список этапов берём из реестра — не расходится с меню
+	local def num key icon title cat fn
+	for def in "${STAGE_DEFS[@]}"; do
+		IFS='|' read -r num key icon title cat fn <<<"$def"
+		[[ -n "$key" ]] || continue
+		printf '  %2s) %s\n' "$num" "$title"
+	done
+	echo "  ${C_DIM}Откат восстанавливает файлы этапа из последнего бэкапа.${C_RESET}"
 	read -rp "  ${ICON_ARROW} " sn
 
-	local stage
-	case "$sn" in
-	1) stage="stage1_update" ;; 2) stage="stage2_admin_user" ;;
-	3) stage="stage3_root_password" ;; 4) stage="stage4_ssh_key" ;;
-	5) stage="stage5_ssh_config" ;; 6) stage="stage6_sftp_user" ;;
-	7) stage="stage7_ufw" ;; 8) stage="stage8_autoupdate" ;;
-	9) stage="stage9_intrusion" ;; 10) stage="stage10_dns" ;;
-	11) stage="stage11_fish" ;; 12) stage="stage12_timezone" ;;
-	13) stage="stage13_lynis" ;; 14) stage="stage14_disk" ;;
-	15) stage="stage15_bbr" ;;
-	*)
+	local stage=""
+	def=$(stage_def "$sn") || {
 		log_err "Неверный выбор"
 		return 1
-		;;
-	esac
+	}
+	stage=$(cut -d'|' -f2 <<<"$def")
+	[[ -n "$stage" ]] || {
+		log_err "У этого этапа нет бэкапов"
+		return 1
+	}
 
 	# бэкапы всех сессий, а не только текущей: берём последний каталог с этим этапом
 	local bdir=""
@@ -2151,50 +2211,79 @@ stage_rollback() {
 #  ГЛАВНОЕ МЕНЮ
 # ═══════════════════════════════════════════════════════════════════
 
+# Справка по этапам прямо из меню — те же данные, что и в --help
+show_stage_help() {
+	local def num key icon title cat fn done_total=0 done_done=0
+	echo ""
+	repeat_hdr "Этапы и порядок"
+	local c
+	for c in "${CATEGORY_ORDER[@]}"; do
+		printf "  ${C_BOLD}${C_CYAN}▸ %s${C_RESET}\n" "$(category_title "$c")"
+		for def in "${STAGE_DEFS[@]}"; do
+			IFS='|' read -r num key icon title cat fn <<<"$def"
+			[[ "$cat" == "$c" ]] || continue
+			printf "   %b%-3s%b %s\n" "${C_DIM}" "$num)" "$C_RESET" "$title"
+			[[ -n "$key" ]] && {
+				done_total=$((done_total + 1))
+				[[ "$(get_stage_status "$key")" == "completed" ]] && done_done=$((done_done + 1))
+			}
+		done
+		echo ""
+	done
+	echo "  ${C_DIM}Порядок для нового сервера: 0, 1, 2, 4 → проверь вход по ключу…"
+	echo "  ${C_DIM}→ 7 (фаервол) → 5 (порт и пароли) → 8, 9 → 3 (пароль root) → остальное.${C_RESET}"
+	printf '  ${C_DIM}Выполнено: %d из %d этапов${C_RESET}\n' "$done_done" "$done_total"
+	echo ""
+	read -rp "  Enter — в меню... " _
+}
+
 main_menu() {
 	while true; do
-		printf '\n%.0s' {1..4}
+		printf '\n%.0s' {1..3}
 
-		echo -e "${C_BOLD}${C_CYAN}╔══ Seq VPS Security${C_RESET} ${C_DIM}— ${DISTRO_NAME}${C_RESET} ${C_BOLD}${C_CYAN}══════════════════════════════════╗${C_RESET}"
-		echo ""
+		{
+			local line pad
+			printf -v line '%*s' "$TERM_WIDTH" ''
+			printf "${C_BOLD}${C_CYAN}╔══ ${C_RESET}${C_BOLD}Seq VPS Security${C_RESET} ${C_DIM}v%s · %s${C_RESET}\n" "$SCRIPT_VERSION" "$DISTRO_NAME"
+			pad=$((TERM_WIDTH - 4))
+			((pad > 1)) && printf "${C_BOLD}${C_CYAN}╚%s${C_RESET}\n" "${line:0:pad}" | sed "s/ /═/g"
+		}
 
 		show_server_summary
 
-		echo -e "${C_BOLD}${C_GREEN}  Действия:${C_RESET}"
-		echo ""
-		menu_item 0 "" "Установка утилит (micro, mc)"
-		menu_item 1 "stage1_update" "Обновление системы"
-		menu_item 2 "stage2_admin_user" "Управление пользователями"
-		menu_item 3 "stage3_root_password" "Изменение пароля root"
-		menu_item 4 "stage4_ssh_key" "Установка SSH-ключа"
-		menu_item 5 "stage5_ssh_config" "Настройка SSH"
-		menu_item 6 "stage6_sftp_user" "Создание SFTP пользователя"
-		menu_item 7 "stage7_ufw" "Настройка UFW"
-		menu_item 8 "stage8_autoupdate" "Автообновления безопасности"
-		menu_item 9 "stage9_intrusion" "Защита от брутфорса (CrowdSec/Fail2Ban)"
-		menu_item 10 "stage10_dns" "Настройка DNS"
-		menu_item 11 "stage11_fish" "Установка Fish shell"
-		menu_item 12 "stage12_timezone" "Часовой пояс и синхронизация времени"
-		menu_item 13 "stage13_lynis" "Аудит безопасности (Lynis)"
-		menu_item 14 "stage14_disk" "Мониторинг диска и большие файлы"
-		menu_item 15 "stage15_bbr" "BBR congestion control"
-		echo ""
-		echo -e "  ${C_YELLOW}R${C_RESET}) Откат          ${C_RED}Q${C_RESET}) Выход"
+		local def num key icon title cat fn c
+		local cat_done cat_total done_total=0 done_done=0
+		for c in "${CATEGORY_ORDER[@]}"; do
+			cat_done=0
+			cat_total=0
+			for def in "${STAGE_DEFS[@]}"; do
+				IFS='|' read -r num key icon title cat fn <<<"$def"
+				[[ "$cat" == "$c" && -n "$key" ]] || continue
+				cat_total=$((cat_total + 1))
+				[[ "$(get_stage_status "$key")" == "completed" ]] && cat_done=$((cat_done + 1))
+			done
+			done_total=$((done_total + cat_total))
+			done_done=$((done_done + cat_done))
+
+			repeat_hdr "$(category_icon "$c")" "$(category_title "$c")" "$(category_color "$c")"
+			[[ $cat_total -gt 0 ]] && printf "  ${C_DIM}%d из %d выполнено${C_RESET}\n" "$cat_done" "$cat_total"
+			for def in "${STAGE_DEFS[@]}"; do
+				IFS='|' read -r num key icon title cat fn <<<"$def"
+				[[ "$cat" == "$c" ]] || continue
+				menu_item "$num" "$key" "$title"
+			done
+			echo ""
+		done
+
+		echo -e "  ${C_YELLOW}H${C_RESET}) Справка      ${C_YELLOW}R${C_RESET}) Откат      ${C_RED}Q${C_RESET}) Выход"
 		echo ""
 
-		# Прогресс-бар: сколько этапов выполнено
-		local total=15 done=0 s
-		for s in stage1_update stage2_admin_user stage3_root_password stage4_ssh_key \
-			stage5_ssh_config stage6_sftp_user stage7_ufw stage8_autoupdate stage9_intrusion \
-			stage10_dns stage11_fish stage12_timezone stage13_lynis stage14_disk stage15_bbr; do
-			[[ "$(get_stage_status "$s")" == "completed" ]] && done=$((done + 1))
-		done
-		if [[ $done -gt 0 ]]; then
+		if [[ $done_done -gt 0 ]]; then
 			printf "  Прогресс: "
-			progress_bar "$done" "$total" ""
+			progress_bar "$done_done" "$done_total" ""
+			echo ""
 			echo ""
 		fi
-		echo ""
 
 		if ! read -rp "  ${ICON_ARROW} " choice; then
 			log_info "Ввод завершён"
@@ -2202,29 +2291,20 @@ main_menu() {
 		fi
 
 		case "${choice,,}" in
-		0) stage_utilities ;;
-		1) stage_update ;;
-		2) stage_users ;;
-		3) stage_root_password ;;
-		4) stage_ssh_key ;;
-		5) stage_ssh_config ;;
-		6) stage_sftp_user ;;
-		7) stage_ufw ;;
-		8) stage_autoupdate ;;
-		9) stage_intrusion ;;
-		10) stage_dns ;;
-		11) stage_fish ;;
-		12) stage_timezone ;;
-		13) stage_lynis ;;
-		14) stage_disk ;;
-		15) stage_bbr ;;
+		h) show_stage_help ;;
 		r) stage_rollback ;;
 		q)
 			echo ""
 			log_info "Выход. Лог: ${C_DIM}$LOG_FILE${C_RESET}"
 			exit 0
 			;;
-		*) log_err "Неверный выбор" ;;
+		*)
+			if stage_def "${choice,,}" >/dev/null 2>&1; then
+						run_stage "${choice,,}"
+			else
+						log_err "Неверный выбор"
+			fi
+			;;
 		esac
 
 		echo ""
@@ -2237,7 +2317,7 @@ main_menu() {
 # ═══════════════════════════════════════════════════════════════════
 
 show_help() {
-	echo "Seq VPS Security Script"
+	echo "Seq VPS Security · v${SCRIPT_VERSION}"
 	echo ""
 	echo "  Комплексная настройка безопасности VPS сервера."
 	echo "  Поддерживает: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux."
@@ -2247,22 +2327,16 @@ show_help() {
 	echo "    sudo ./seq_vps.sh --help   — эта справка"
 	echo ""
 	echo "  Этапы:"
-	echo "    1. Обновление системы"
-	echo "    2. Управление пользователями (создание, sudo, удаление)"
-	echo "    3. Смена пароля root"
-	echo "    4. Установка SSH-ключа"
-	echo "    5. Настройка SSH (порт, аутентификация, root-доступ)"
-	echo "    6. Создание SFTP пользователя (chroot)"
-	echo "    7. Настройка UFW (фаервол)"
-	echo "    8. Автообновления безопасности"
-	echo "    9. Защита от брутфорса (CrowdSec или Fail2Ban)"
-	echo "   10. Настройка DNS"
-	echo "   11. Установка Fish shell"
-	echo "   12. Часовой пояс и синхронизация времени (NTP)"
-	echo "   13. Аудит безопасности (Lynis)"
-	echo "   14. Мониторинг диска и поиск больших файлов"
-	echo "   15. BBR congestion control (ускорение TCP)"
-	echo "    R. Откат этапа из бэкапа"
+	local def num key icon title cat fn c
+	for c in "${CATEGORY_ORDER[@]}"; do
+		echo "   $(category_title "$c"):"
+		for def in "${STAGE_DEFS[@]}"; do
+			IFS='|' read -r num key icon title cat fn <<<"$def"
+			[[ "$cat" == "$c" ]] || continue
+			printf '    %2s. %s\n' "$num" "$title"
+		done
+	done
+	echo "     R. Откат этапа из бэкапа"
 	echo ""
 	echo "  Данные: /opt/seq_vps/"
 	echo ""
