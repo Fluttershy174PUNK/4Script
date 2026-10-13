@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 4script.sh — Комплексная защита VPS сервера
+# 4script.sh — 4Script: простой скрипт защиты сервера (simple-server-security-script)
 # Debian/Ubuntu · Fedora/RHEL/CentOS · Rocky · AlmaLinux
 #
 # Использование: sudo ./4script.sh [--help]
@@ -10,6 +10,21 @@
 # (неверный номер, несовпавшие пароли) убивал бы весь скрипт вместо возврата в меню.
 # Критичные операции проверяются явно (sshd -t перед рестартом).
 set -uo pipefail
+
+# ═══════════════════════════════════════════════════════════════════
+#  ЛОКАЛЬ: ШИРИНА КИРИЛЛИЦЫ
+# ═══════════════════════════════════════════════════════════════════
+# При пустом LANG (частый случай для неинтерактивного ssh и супервизоров)
+# bash считает длину строки в БАЙТАХ. Видимые последствия:
+#   - printf '%-20s' выравнивает колонки криво;
+#   - ${var:0:N} режет многобайтный символ пополам и печатает «битый» символ.
+# Переключаемся на C.UTF-8, если текущая локаль не UTF-8; C.UTF-8 есть
+# практически везде и не требует генерации.
+if [[ "${LC_ALL:-${LANG:-}}" != *UTF-8* && "${LC_ALL:-${LANG:-}}" != *utf8* ]]; then
+	if command -v locale &>/dev/null && locale -a 2>/dev/null | grep -qiE '^C\.(UTF-8|utf8)$'; then
+		export LC_ALL=C.UTF-8
+	fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════
 #  ЦВЕТА И СТИЛИ
@@ -81,7 +96,7 @@ SSH_SERVICE=""
 SUDO_GROUP=""
 HAS_SELINUX=false
 
-readonly SCRIPT_VERSION="1.2"
+readonly SCRIPT_VERSION="2.0"
 
 # ═══════════════════════════════════════════════════════════════════
 #  РЕЕСТР ЭТАПОВ — единственный источник правды для меню, прогресса,
@@ -500,7 +515,7 @@ ssh_port_from_config() {
 }
 
 show_server_summary() {
-	echo -e "${C_BOLD}${C_CYAN}┌─${C_RESET} ${C_BOLD}СВОДКА СЕРВЕРА${C_RESET} ${C_DIM}— Seq VPS Security${C_RESET}"
+	echo -e "${C_BOLD}${C_CYAN}┌─${C_RESET} ${C_BOLD}СВОДКА СЕРВЕРА${C_RESET} ${C_DIM}— 4Script${C_RESET}"
 
 	# ── Пользователи ──
 	echo -e "\n${C_BOLD}${ICON_USER}  Пользователи:${C_RESET}"
@@ -3623,7 +3638,7 @@ main_menu() {
 		{
 			local line pad
 			printf -v line '%*s' "$TERM_WIDTH" ''
-			printf "${C_BOLD}${C_CYAN}╔══ ${C_RESET}${C_BOLD}Seq VPS Security${C_RESET} ${C_DIM}v%s · %s${C_RESET}\n" "$SCRIPT_VERSION" "$DISTRO_NAME"
+			printf "${C_BOLD}${C_CYAN}╔══ ${C_RESET}${C_BOLD}4Script${C_RESET} ${C_DIM}simple-server-security-script · v%s · %s${C_RESET}\n" "$SCRIPT_VERSION" "$DISTRO_NAME"
 			pad=$((TERM_WIDTH - 4))
 			((pad > 1)) && printf "${C_BOLD}${C_CYAN}╚%s${C_RESET}\n" "${line:0:pad}" | sed "s/ /═/g"
 		}
@@ -3654,7 +3669,7 @@ main_menu() {
 			echo ""
 		done
 
-		echo -e "  ${C_YELLOW}H${C_RESET}) Справка      ${C_YELLOW}R${C_RESET}) Откат      ${C_RED}Q${C_RESET}) Выход"
+		echo -e "  ${C_YELLOW}P${C_RESET}) Настройки     ${C_YELLOW}H${C_RESET}) Справка      ${C_YELLOW}R${C_RESET}) Откат      ${C_RED}Q${C_RESET}) Выход"
 		echo ""
 
 		if [[ $done_done -gt 0 ]]; then
@@ -3670,6 +3685,7 @@ main_menu() {
 		fi
 
 		case "${choice,,}" in
+		p) show_profiles ;;
 		h) show_stage_help ;;
 		r) stage_rollback ;;
 		q)
@@ -3692,11 +3708,153 @@ main_menu() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  ТЕКУЩИЕ НАСТРОЙКИ (что именно сейчас применяется)
+# ═══════════════════════════════════════════════════════════════════
+
+# Показывает файл целиком, если он есть. Второй аргумент — заголовок.
+_show_conf_file() {
+	local f="$1" title="$2" lines
+	printf "  ${C_BOLD}%s${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$title" "$f"
+	if [[ ! -f "$f" ]]; then
+		echo -e "    ${C_DIM}(не создан)${C_RESET}"
+		return 0
+	fi
+	# содержимое без комментариев, отступ, ограничение по строкам
+	lines=$(grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)
+	if [[ -z "$lines" ]]; then
+		echo -e "    ${C_DIM}(файл есть, активных строк нет)${C_RESET}"
+	else
+		echo "$lines" | head -12 | sed 's/^/    /'
+		local n
+		n=$(wc -l <<<"$lines")
+		[[ $n -gt 12 ]] && echo -e "    ${C_DIM}… ещё $((n - 12)) строк${C_RESET}"
+	fi
+}
+
+# Одна строка «параметр: значение» для быстрых проверок
+_show_kv() {
+	printf "    %-38s %b%s%b\n" "$1" "${3:-}" "$2" "$C_RESET"
+}
+
+show_profiles() {
+	printf '\n%.0s' {1..2}
+	repeat_hdr "$ICON_GEAR" "Текущие настройки (что применяется сейчас)"
+
+	# ── SSH ──
+	echo ""
+	echo -e "${C_BOLD}${ICON_KEY}  SSH${C_RESET}"
+	_ssh_port_refresh
+	local sc
+	sc=$(sshd -T 2>/dev/null)
+	_show_kv "Порт" "$CURRENT_SSH_PORT"
+	_show_kv "Парольный вход" "$(_sshd_option "$sc" passwordauthentication yes)" \
+		"$([[ "$(_sshd_option "$sc" passwordauthentication yes)" == "no" ]] && echo "$C_GREEN" || echo "$C_RED")"
+	_show_kv "Keyboard-interactive" "$(_sshd_option "$sc" kbdinteractiveauthentication yes)"
+	_show_kv "Вход root" "$(_sshd_option "$sc" permitrootlogin yes)"
+	_show_kv "MaxAuthTries" "$(_sshd_option "$sc" maxauthtries 6)"
+	_show_kv "Пустые пароли" "$(_sshd_option "$sc" permitemptypasswords no)"
+	_show_kv "PerSourcePenalties" "$(_sshd_option "$sc" persourcepenalties 'нет (OpenSSH < 9.8)')"
+	_show_conf_file "$SSHD_CONFIG_D/$SEQ_SSHD_DROPIN" "drop-in SSH"
+
+	# ── Фаервол ──
+	echo ""
+	echo -e "${C_BOLD}${ICON_FIRE}  Фаервол ($(_fw_cmd))${C_RESET}"
+	if [[ "$(_fw_cmd)" == firewalld ]]; then
+		if firewall-cmd --state 2>/dev/null | grep -q running; then
+			_show_kv "Состояние" "active" "$C_GREEN"
+			firewall-cmd --list-ports 2>/dev/null | sed 's/^/    порты: /'
+		else
+			_show_kv "Состояние" "не активен" "$C_YELLOW"
+		fi
+	elif command -v ufw &>/dev/null; then
+		if ufw status 2>/dev/null | grep -q "Status: active"; then
+			_show_kv "Состояние" "active" "$C_GREEN"
+			ufw status 2>/dev/null | grep -E '^[0-9]' | head -8 | sed 's/^/    /'
+		else
+			_show_kv "Состояние" "не активен" "$C_YELLOW"
+		fi
+	else
+		_show_kv "Состояние" "не установлен" "$C_DIM"
+	fi
+	[[ -f /etc/default/ufw ]] && _show_kv "UFW IPv6" "$(grep -E '^IPV6=' /etc/default/ufw | cut -d= -f2)"
+
+	# ── Ядро ──
+	echo ""
+	echo -e "${C_BOLD}🧩  Ядро (sysctl)${C_RESET}"
+	_show_kv "congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+	_show_kv "IPv6" "$([[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == "1" ]] && echo отключён || echo включён)"
+	_show_conf_file "$(_sysctl_conf)" "харденинг"
+	_show_conf_file "$(_ipv6_conf)" "IPv6"
+	_show_conf_file "/etc/sysctl.d/90-bbr.conf" "BBR"
+
+	# ── PAM / блокировки ──
+	echo ""
+	echo -e "${C_BOLD}🔐  Пароли и блокировки (PAM)${C_RESET}"
+	if _pam_faillock_active; then
+		_show_kv "pam_faillock" "включён" "$C_GREEN"
+		grep -A2 "^$OWN_MARK" /etc/security/faillock.conf 2>/dev/null | grep -E 'deny|unlock_time' | sed 's/^/    /'
+	else
+		_show_kv "pam_faillock" "выключен" "$C_DIM"
+	fi
+	if _pam_pwquality_active; then
+		_show_kv "pam_pwquality" "включён" "$C_GREEN"
+	else
+		_show_kv "pam_pwquality" "выключен" "$C_DIM"
+	fi
+
+	# ── Аудит событий ──
+	echo ""
+	echo -e "${C_BOLD}📋  Аудит событий (auditd)${C_RESET}"
+	if systemctl is-active --quiet auditd 2>/dev/null; then
+		_show_kv "auditd" "запущен, правил $(auditctl -l 2>/dev/null | grep -c .)" "$C_GREEN"
+	else
+		_show_kv "auditd" "не запущен" "$C_DIM"
+	fi
+	_show_conf_file "/etc/audit/rules.d/99-seq-vps.rules" "правила 4script"
+
+	# ── Обновления и DNS ──
+	echo ""
+	echo -e "${C_BOLD}⬆  Обновления и DNS${C_RESET}"
+	local au="не настроены"
+	if [[ "$PKG_MGR" == apt ]] && [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
+		au="unattended-upgrades: $(grep -c 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades) настроек"
+	elif [[ -f /etc/dnf/automatic.conf ]]; then
+		au="dnf-automatic"
+	fi
+	_show_kv "Автообновления" "$au"
+	local rt="выключена"
+	if [[ -f /etc/apt/apt.conf.d/50unattended-upgrades-local ]]; then
+		rt=$(grep -oE 'Automatic-Reboot "true"' /etc/apt/apt.conf.d/50unattended-upgrades-local &>/dev/null && echo "включена" || echo "выключена")
+	fi
+	_show_kv "Авто-перезагрузка" "$rt"
+	_show_kv "DNS ($(_dns_backend))" "$(tr '\n' ' ' <<<"$(_dns_current)")"
+	_show_conf_file "/etc/systemd/resolved.conf.d/10-seq-vps.conf" "DNS через resolved"
+
+	# ── Где данные и что файл 4script создал ──
+	echo ""
+	echo -e "${C_BOLD}📁  Данные${C_RESET}"
+	_show_kv "Каталог" "$DATA_DIR"
+	_show_kv "Лог текущего запуска" "$LOG_FILE"
+	local nconf=0 f
+	for f in "$SSHD_CONFIG_D/$SEQ_SSHD_DROPIN" "$(_sysctl_conf)" "$(_ipv6_conf)" \
+		/etc/systemd/resolved.conf.d/10-seq-vps.conf /etc/audit/rules.d/99-seq-vps.rules \
+		/etc/fail2ban/jail.local; do
+		[[ -e "$f" ]] && nconf=$((nconf + 1))
+	done
+	_show_kv "Файлов настроек 4script" "$nconf"
+
+	echo ""
+	echo -e "  ${C_DIM}Изменения откатываются через R (файлы этапов лежат в бэкапах).${C_RESET}"
+	echo ""
+	read -rp "  Enter — в меню... " _
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  ТОЧКА ВХОДА
 # ═══════════════════════════════════════════════════════════════════
 
 show_help() {
-	echo "Seq VPS Security · v${SCRIPT_VERSION}"
+	echo "4Script — simple-server-security-script · v${SCRIPT_VERSION}"
 	echo ""
 	echo "  Комплексная настройка безопасности VPS сервера."
 	echo "  Поддерживает: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux."
@@ -3734,7 +3892,7 @@ main() {
 	}
 	init_status_file
 
-	log_info "Seq VPS Security · ${C_BOLD}$DISTRO_NAME${C_RESET}"
+	log_info "4Script · ${C_BOLD}$DISTRO_NAME${C_RESET}"
 	log_info "Лог: ${C_DIM}$LOG_FILE${C_RESET}"
 	log_info "Бэкапы: ${C_DIM}$BACKUP_DIR${C_RESET}"
 
