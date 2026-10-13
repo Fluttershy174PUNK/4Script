@@ -95,6 +95,7 @@ readonly STAGE_DEFS=(
 	"16|stage16_sysctl|🧩|Харденинг ядра (sysctl)|system|stage_sysctl"
 	"17|stage17_audit|🔎|Аудит: порты, учётки, SUID, LSM|system|stage_audit"
 	"18|stage18_pam|🔐|Пароли и блокировки (PAM)|protect|stage_pam"
+	"19|stage19_auditd|📋|Аудит событий (auditd)|protect|stage_auditd"
 )
 readonly CATEGORY_ORDER=(setup access protect system)
 
@@ -3111,6 +3112,147 @@ _pam_restore() {
 		esac
 		done
 	log_ok "PAM восстановлен из $bdir"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 19: АУДИТ СОБЫТИЙ (auditd)
+# ═══════════════════════════════════════════════════════════════════
+
+# Без аудиторского следа разбор инцидента невозможен: видно, кто менял
+# /etc/passwd и sudoers, кто запускал команды от root, загрузку модулей.
+stage_auditd() {
+	stage_banner "📋" "19" "Аудит событий (auditd)"
+
+	if ! command -v auditctl &>/dev/null; then
+		log_info "auditd не установлен — устанавливаю..."
+		pkg_install_retry "auditd" || {
+			update_stage_status "stage19_auditd" "failed"
+			return 1
+		}
+	fi
+
+	local rules_dir="/etc/audit/rules.d"
+	local rules="$rules_dir/99-seq-vps.rules"
+	mkdir -p "$rules_dir"
+
+	echo -e "${C_BOLD}▸ Текущее состояние:${C_RESET}"
+	if systemctl is-active --quiet auditd 2>/dev/null; then
+		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  auditd запущен"
+	else
+		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  auditd не запущен"
+	fi
+	local cur_rules
+	cur_rules=$(auditctl -l 2>/dev/null | grep -c . || true)
+	echo -e "  ${C_DIM}активных правил сейчас: ${cur_rules:-0}${C_RESET}"
+	[[ -f "$rules" ]] && echo -e "  ${C_DIM}файл seq_vps: есть${C_RESET}" || echo -e "  ${C_DIM}файл seq_vps: нет${C_RESET}"
+
+	echo ""
+	echo -e "  ${C_BOLD}Правила, которые будут добавлены:${C_RESET}"
+	echo "    - изменения /etc/passwd, /etc/shadow, /etc/group, /etc/sudoers*"
+	echo "    - изменения SSH-конфигов и authorized_keys"
+	echo "    - команды от имени root (execve с euid=0)"
+	echo "    - загрузка/выгрузка модулей ядра"
+	echo "    - изменения времени (timedatectl/settimeofday)"
+	echo "    - монтирования"
+	echo ""
+	confirm "Применить правила?" || {
+		log_info "Пропущено"
+		return 0
+	}
+
+	backup_file "$rules" "stage19_auditd"
+	cat >"$rules" <<'EOF'
+# seq_vps: базовый аудит — ключевые файлы, root-команды, модули ядра
+# Просмотр: ausearch -k <ключ>   |   aureport --summary
+
+# Идентификация и полномочия
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+
+# Вход по SSH и ключи
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+
+# Команды от root (потенциальная эскалация)
+-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=-1 -k root_commands
+-a always,exit -F arch=b32 -S execve -F euid=0 -F auid>=1000 -F auid!=-1 -k root_commands
+
+# Модули ядра
+-w /sbin/insmod -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-a always,exit -F arch=b64 -S init_module,delete_module -k modules
+
+# Время и монтирование
+-a always,exit -F arch=b64 -S settimeofday,clock_settime -k time_change
+-a always,exit -F arch=b64 -S mount -k mounts
+
+# Файловая система: делать неизменяемым после загрузки правил
+-e 2
+EOF
+
+	# Догрузка правил: augenrules собирает rules.d/*.rules в audit.rules
+	if command -v augenrules &>/dev/null; then
+		augenrules --load &>>"$LOG_FILE" || log_warn "augenrules --load сообщил об ошибке (см. лог)"
+	else
+		log_warn "augenrules не найден — правила применятся после перезагрузки"
+	fi
+
+	systemctl enable auditd 2>/dev/null || true
+	systemctl restart auditd 2>/dev/null || systemctl start auditd 2>/dev/null || true
+	sleep 2
+
+	local active now_rules
+	active=false
+	systemctl is-active --quiet auditd && active=true
+	now_rules=$(auditctl -l 2>/dev/null | grep -c . || true)
+
+	if ! $active; then
+		# Частая причина в контейнерах (LXC/OpenVZ/Docker): нет прав на
+		# cap_sys_nice/аудит, и auditd падает при старте. Сообщаем точно.
+		local why=""
+		if journalctl -u auditd -n 20 --no-pager 2>/dev/null | grep -qi 'Cannot change priority\|Operation not permitted'; then
+			why="контейнер не даёт прав на аудит (нет cap_sys_nice/audit_control)"
+		else
+			why="смотрите: systemctl status auditd"
+		fi
+		log_err "auditd не запустился: $why"
+		log_info "Правила остались в $rules — на хосте (или в VM) они заведутся"
+		# не оставляем неработающий сервис в цикле перезапусков
+		systemctl reset-failed auditd 2>/dev/null || true
+		update_stage_status "stage19_auditd" "failed"
+		return 1
+	fi
+	log_ok "auditd запущен, правил: ${now_rules:-0}"
+
+	# Проверяем, что правило действительно работает: трогаем файл из-под аудита
+	if command -v ausearch &>/dev/null && auditctl -l 2>/dev/null | grep -q 'key=identity'; then
+		log_info "Проверка правила: меняю /etc/group (временная запись) и ищу след..."
+		local before after
+		before=$(ausearch -k identity -ts recent 2>/dev/null | grep -c 'type=' || true)
+		groupadd seq_audit_probe 2>/dev/null || true
+		groupdel seq_audit_probe 2>/dev/null || true
+		sleep 1
+		after=$(ausearch -k identity -ts recent 2>/dev/null | grep -c 'type=' || true)
+		if [[ "${after:-0}" -gt "${before:-0}" ]]; then
+			log_ok "Аудит фиксирует события (/etc/group: было $before записей, стало $after)"
+		else
+			log_info "Новых записей не видно — проверьте: ausearch -k identity -ts recent"
+		fi
+	fi
+
+	echo ""
+	echo -e "  ${C_DIM}Посмотреть события: ausearch -k identity${C_RESET}"
+	echo -e "  ${C_DIM}Сводка:            aureport --summary${C_RESET}"
+	echo -e "  ${C_DIM}Отчёты по входу:   aureport -l${C_RESET}"
+	echo -e "  ${C_YELLOW}${ICON_WARN}  Локальные логи root может очистить — для продакшена настройте
+  отправку на внешний syslog (rsyslog/vector/journald upload).${C_RESET}"
+
+	update_stage_status "stage19_auditd" "completed"
 }
 
 # ═══════════════════════════════════════════════════════════════════
