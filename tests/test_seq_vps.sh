@@ -14,6 +14,15 @@ TERM_WIDTH=5
 assert_eq "$(hr | sed $'s/\033\\[[0-9;]*m//g')" '─────' 'thin rule is valid UTF-8'
 assert_eq "$(hr_thick | sed $'s/\033\\[[0-9;]*m//g')" '═════' 'thick rule is valid UTF-8'
 
+# Обрезка длинных названий не должна рвать многобайтные символы
+# (в POSIX-locale bash режет по байтам и оставляет битый «�»).
+long='Управление пользователями и группами доступа'
+trunc=$(text_truncate "$long" 20)
+assert_eq "$(printf '%s' "$trunc" | LC_ALL=C.UTF-8 wc -m | tr -d ' ')" '20' 'truncate keeps character count'
+printf '%s' "$trunc" | LC_ALL=C.UTF-8 iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || fail 'truncate corrupts UTF-8'
+assert_eq "$(text_truncate 'short' 46)" 'short' 'truncate leaves short text alone'
+assert_eq "$(text_truncate 'Управление пользователями' 46)" 'Управление пользователями' 'truncate keeps text under limit'
+
 bar=$(progress_bar 1 2 | sed $'s/\033\\[[0-9;]*m//g' | tr -d '\r')
 [[ "$bar" == *'███████████████'* && "$bar" == *'░░░░░░░░░░░░░░░'* && "$bar" == *'50%'* ]] || fail 'progress bar uses intact UTF-8 and correct percentage'
 
@@ -37,8 +46,13 @@ for def in "${STAGE_DEFS[@]}"; do
 	seen_fns+="$fn "
 done
 
-# Каждая stage_* функция должна быть в реестре — иначе этап недостижим из меню
-for fn in $(compgen -A function | grep '^stage_' | grep -v '^stage_banner$'); do
+# Каждая функция-этап должна быть в реестре — иначе этап недостижим из меню.
+# Исключения — служебные функции с тем же префиксом.
+for fn in $(compgen -A function | grep '^stage_'); do
+	# stage_rollback — действие меню (R), не этап из реестра
+	case "$fn" in
+	stage_banner | stage_def | stage_status_template | stage_rollback) continue ;;
+	esac
 	[[ "$seen_fns" == *" $fn "* ]] || fail "stage function missing from registry: $fn"
 done
 
@@ -74,11 +88,15 @@ assert_eq "$(_sshd_option 'PasswordAuthentication no' passwordauthentication yes
 assert_eq "$(_sshd_option 'banner none' passwordauthentication yes)" 'yes' 'missing option falls back to default'
 
 # ── Ввод пароля (без изменений системы) ──────────────────────────────
+# Важно: через '< <(...)', а не 'printf | _read_new_password', иначе функция
+# работает в subshell и присваивание переменной вызывающего не видно.
 pw=''
-printf 'secret\nsecret\n' | _read_new_password pw 2>/dev/null || fail 'matching passwords accepted'
+_read_new_password pw < <(printf 'secret\nsecret\n') >/dev/null 2>&1 || fail 'matching passwords accepted'
 assert_eq "$pw" 'secret' 'password reaches target variable'
-printf 'a\nb\n' | _read_new_password pw 2>/dev/null && fail 'mismatched passwords accepted' || true
-printf '\n\n' | _read_new_password pw 2>/dev/null && fail 'empty password accepted' || true
+_read_new_password pw < <(printf 'a\nb\n') >/dev/null 2>&1 && fail 'mismatched passwords accepted' || true
+pw=''
+_read_new_password pw < <(printf '\n\n') >/dev/null 2>&1 && fail 'empty password accepted' || true
+assert_eq "$pw" '' 'empty password leaves target untouched'
 
 # A non-interactive run must not start a background spinner or print ANSI colors.
 SPINNER_PID=''

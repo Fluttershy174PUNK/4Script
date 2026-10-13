@@ -65,7 +65,7 @@ SSH_SERVICE=""
 SUDO_GROUP=""
 HAS_SELINUX=false
 
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.2"
 
 # ═══════════════════════════════════════════════════════════════════
 #  РЕЕСТР ЭТАПОВ — единственный источник правды для меню, прогресса,
@@ -202,6 +202,13 @@ hr_thick() {
 	printf "${C_BLUE}%s${C_RESET}\n" "${line// /═}"
 }
 
+# Обрезка строки по СИМВОЛАМ, а не байтам: без UTF-8 в locale bash режет
+# многобайтные символы посередине и в терминал уходит битый «�».
+text_truncate() {
+	local s="$1" max="$2"
+	LC_ALL=C.UTF-8 bash -c 's="$1"; printf "%s" "${s:0:$2}"' _ "$s" "$max" 2>/dev/null || printf '%s' "$s"
+}
+
 # Заголовок раздела в меню — ширина не зависит от эмодзи
 repeat_hdr() {
 	local icon="$1" title="$2" color="${3:-$C_CYAN}"
@@ -284,7 +291,7 @@ menu_item() {
 	else
 		num_fmt="${C_DIM}$(printf '%-3s' "${num})")${C_RESET}"
 	fi
-	printf "  %b %b%-50s%b\n" "$num_fmt" "$mark" "${text:0:46}" "$color"
+	printf "  %b %b%-50s%b\n" "$num_fmt" "$mark" "$(text_truncate "$text" 46)" "$color"
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -379,13 +386,20 @@ get_stage_status() {
 }
 
 # Порт sshd одним способом: Port из эффективного конфига, иначе 22.
-# Заодно обновляет CURRENT_SSH_PORT — он используется в подсказках и проверках.
+# Только печатает — присваивание делает вызывающий (CURRENT_SSH_PORT=$(_ssh_port)),
+# потому что из $(...) внутреннее присваивание до родителя не доходит.
 _ssh_port() {
-	local cfg
+	local cfg port
 	cfg=$(sshd -T 2>/dev/null) || cfg=""
-	CURRENT_SSH_PORT=$(ssh_port_from_config "$cfg")
-	CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
-	printf '%s' "$CURRENT_SSH_PORT"
+	port=$(ssh_port_from_config "$cfg")
+	printf '%s' "${port:-22}"
+}
+
+# Синхронизация CURRENT_SSH_PORT. Ничего не печатает и НЕ оборачивается
+# в $( ) — иначе присваивание осталось бы в subshell и подсказки показывали бы 22.
+# Вызов: _ssh_port_refresh; local sp=$CURRENT_SSH_PORT
+_ssh_port_refresh() {
+	CURRENT_SSH_PORT=$(_ssh_port)
 }
 
 # Значение директивы из вывода sshd -T (имена там в нижнем регистре): _sshd_option "<дамп>" name default
@@ -396,30 +410,34 @@ _sshd_option() {
 }
 
 # Двойной ввод пароля с проверкой. Пароль возвращается в переменную с именем $1.
+# Имена здесь с префиксом: локальная переменная, совпадающая с именем
+# переменной вызывающего, перехватила бы printf -v, и пароль потерялся бы
+# (а chpasswd получил бы пустой пароль).
 _read_new_password() {
-	local var="$1" label="${2:-Пароль}" pw pw2
-	read -rsp "  ${label}: " pw
+	local var="$1" label="${2:-Пароль}"
+	local _rnp_pw _rnp_pw2
+	read -rsp "  ${label}: " _rnp_pw
 	echo
-	read -rsp "  Подтвердите: " pw2
+	read -rsp "  Подтвердите: " _rnp_pw2
 	echo
-	[[ "$pw" == "$pw2" ]] || {
+	[[ "$_rnp_pw" == "$_rnp_pw2" ]] || {
 		log_err "Пароли не совпадают"
 		return 1
 	}
-	[[ -n "$pw" ]] || {
+	[[ -n "$_rnp_pw" ]] || {
 		log_err "Пароль не может быть пустым"
 		return 1
 	}
-	printf -v "$var" '%s' "$pw"
+	printf -v "$var" '%s' "$_rnp_pw"
 }
 
 # Минимальная версия OpenSSH, с которой доступна директива (её нет в старых
 # sshd и _sshd_config_ok отклонит кандидата).
 _sshd_version_at_least() {
-local need="$1" ver
-ver=$(sshd -V 2>&1 | head -1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | cut -d_ -f2)
-[[ -n "$ver" ]] || return 1
-printf '%s\n%s\n' "$need" "$ver" | sort -V -C
+	local need="$1" ver
+	ver=$(sshd -V 2>&1 | head -1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | cut -d_ -f2)
+	[[ -n "$ver" ]] || return 1
+	printf '%s\n%s\n' "$need" "$ver" | sort -V -C
 }
 
 get_regular_users() {
@@ -479,7 +497,8 @@ show_server_summary() {
 	local ssh_cfg
 	ssh_cfg=$(sshd -T 2>/dev/null || true) || true
 	local sp
-	sp=$(_ssh_port)
+	_ssh_port_refresh
+	local sp=$CURRENT_SSH_PORT
 	local pa
 	pa=$(_sshd_option "$ssh_cfg" passwordauthentication yes)
 	local rl
@@ -1285,8 +1304,8 @@ stage_ssh_config() {
 
 	local sc
 	sc=$(sshd -T 2>/dev/null)
-	local sp
-	sp=$(_ssh_port)
+	_ssh_port_refresh
+	local sp=$CURRENT_SSH_PORT
 	local pa
 	pa=$(_sshd_option "$sc" passwordauthentication yes)
 	local rl
@@ -1572,8 +1591,8 @@ _firewalld_menu() {
 	}
 	systemctl enable --now firewalld 2>/dev/null
 
-	local sp
-	sp=$(_ssh_port)
+	_ssh_port_refresh
+	local sp=$CURRENT_SSH_PORT
 
 	while true; do
 		echo ""
@@ -1674,8 +1693,8 @@ stage_ufw() {
 	backup_file "/etc/default/ufw" "stage7_ufw"
 	backup_file "/etc/ufw/ufw.conf" "stage7_ufw"
 
-	local sp
-	sp=$(_ssh_port)
+	_ssh_port_refresh
+	local sp=$CURRENT_SSH_PORT
 
 	while true; do
 		echo ""
@@ -1993,8 +2012,8 @@ _install_fail2ban() {
 	# Базовый jail.local для SSH
 	local f2b_jail="/etc/fail2ban/jail.local"
 	backup_file "$f2b_jail" "stage9_intrusion"
-	local sp
-	sp=$(_ssh_port)
+	_ssh_port_refresh
+	local sp=$CURRENT_SSH_PORT
 
 	# на firewalld-системах iptables-banaction конфликтует — банить через firewalld+ipset
 	local banaction=""
