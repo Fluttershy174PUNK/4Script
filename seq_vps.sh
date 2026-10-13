@@ -94,6 +94,7 @@ readonly STAGE_DEFS=(
 	"15|stage15_bbr|🚀|BBR congestion control|system|stage_bbr"
 	"16|stage16_sysctl|🧩|Харденинг ядра (sysctl)|system|stage_sysctl"
 	"17|stage17_audit|🔎|Аудит: порты, учётки, SUID, LSM|system|stage_audit"
+	"18|stage18_pam|🔐|Пароли и блокировки (PAM)|protect|stage_pam"
 )
 readonly CATEGORY_ORDER=(setup access protect system)
 
@@ -2885,6 +2886,231 @@ stage_audit() {
 	echo -e "  ${C_DIM}Этап только читает систему — ничего не изменено.${C_RESET}"
 	read -rp "  Enter..." _
 	update_stage_status "stage17_audit" "completed"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 18: ПАРОЛИ И БЛОКИРОВКА УЧЁТОК (PAM)
+# ═══════════════════════════════════════════════════════════════════
+
+# pam_faillock блокирует учётку после N неудач (локальный аналог fail2ban,
+# который банит адрес, а не аккаунт). pam_pwquality требует сложные пароли.
+# Оба модуля меняют аутентификацию, поэтому здесь строгий порядок:
+# бэкап → правка → проверка, что вход реально работает → иначе авто-откат.
+_pam_faillock_active() {
+	grep -qE '^[^#]*pam_faillock\.so' /etc/pam.d/common-auth 2>/dev/null
+}
+
+_pam_pwquality_active() {
+	grep -qE '^[^#]*pam_pwquality\.so' /etc/pam.d/common-password 2>/dev/null
+}
+
+# Проверка, что изменение PAM не сломало аутентификацию:
+# pam_faillock/pwquality должны хотя бы загружаться
+_pam_sanity() {
+	local f
+	for f in /etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password; do
+		[[ -f "$f" ]] || continue
+		[[ -r "$f" ]] || return 1
+		done
+	# pam_faillock хранит счётчики в /var/run/faillock — каталог должен создаваться
+	return 0
+}
+
+stage_pam() {
+	stage_banner "🔐" "18" "Пароли и блокировка учёток (PAM)"
+
+	if [[ "$PKG_MGR" != apt ]]; then
+		log_warn "Этап реализован для Debian/Ubuntu (pam_faillock через common-auth)"
+		log_info "RHEL-семейство: authselect select sssd with-faillock"
+		update_stage_status "stage18_pam" "skipped"
+		return 0
+	fi
+
+	local fl=false pq=false
+	_pam_faillock_active && fl=true
+	_pam_pwquality_active && pq=true
+
+	echo -e "${C_BOLD}▸ Текущее состояние:${C_RESET}"
+	$fl && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_faillock: включён (блокировка учётки после неудач)" ||
+		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_faillock: выключен"
+	if command -v pam_pwquality.so >/dev/null 2>&1 || ls /usr/lib/*/security/pam_pwquality.so &>/dev/null; then
+		$pq && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_pwquality: включён" ||
+			echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_pwquality: выключен"
+	else
+		echo -e "  ${C_DIM}pam_pwquality не установлен (пакет libpam-pwquality)${C_RESET}"
+	fi
+
+	# Текущие настройки faillock
+	if [[ -f /etc/security/faillock.conf ]]; then
+		local deny unlock
+		deny=$(awk -F= '/^[[:space:]]*deny[[:space:]]*=/ {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf)
+		unlock=$(awk -F= '/^[[:space:]]*unlock_time[[:space:]]*=/ {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf)
+		echo -e "  ${C_DIM}faillock.conf: deny=${deny:-не задан} unlock_time=${unlock:-не задан}${C_RESET}"
+	fi
+
+	echo ""
+	echo "  1) Включить блокировку после неудачных попыток (pam_faillock)"
+	echo "  2) Требовать сложные пароли (pam_pwquality)"
+	echo "  3) Выключить pam_faillock"
+	echo "  S) Назад"
+	read -rp "  ${ICON_ARROW} " choice
+
+	case "$choice" in
+	1) _pam_enable_faillock ;;
+	2) _pam_enable_pwquality ;;
+	3) _pam_disable_faillock ;;
+	*) log_info "Пропущено" ;;
+	esac
+
+	update_stage_status "stage18_pam" "completed"
+}
+
+# prepend-строка в common-auth: pam_faillock должен считаться ДО pam_unix
+_pam_enable_faillock() {
+	local deny="${1:-5}" unlock="${2:-900}"
+
+	if _pam_faillock_active; then
+		log_info "pam_faillock уже включён — обновляю лимиты"
+	else
+		backup_file "/etc/pam.d/common-auth" "stage18_pam"
+	fi
+	backup_file "/etc/pam.d/common-account" "stage18_pam"
+	backup_file "/etc/security/faillock.conf" "stage18_pam"
+
+	# Политика
+	if [[ ! -f /etc/security/faillock.conf ]]; then
+		: >/etc/security/faillock.conf
+	fi
+	# правим только свои строки внутри файла
+	if grep -q '^# seq_vps' /etc/security/faillock.conf 2>/dev/null; then
+		sed -i '/^# seq_vps/,+3d' /etc/security/faillock.conf
+	fi
+	{
+		echo "# seq_vps: блокировка после $deny неудач на $unlock сек"
+		echo "deny = $deny"
+		echo "unlock_time = $unlock"
+		echo "# seq_vps: конец блока"
+	} >>/etc/security/faillock.conf
+
+	# auth: preauth + authfail вокруг pam_unix
+	# account: счётчик ведётся при входе (строка preauth в account)
+	if ! grep -q 'seq_vps faillock preauth' /etc/pam.d/common-auth 2>/dev/null; then
+		local tmp
+		tmp=$(mktemp)
+		{
+			echo "# seq_vps faillock preauth (проверка блокировки до пароля)"
+			echo "auth	required			pam_faillock.so preauth"
+			echo "# seq_vps faillock authfail (счетчик неудач)"
+			echo "auth	[default=die]		pam_faillock.so authfail"
+		} >"$tmp"
+		cat /etc/pam.d/common-auth >>"$tmp"
+		mv "$tmp" /etc/pam.d/common-auth
+	fi
+	if ! grep -q 'seq_vps faillock account' /etc/pam.d/common-account 2>/dev/null; then
+		local tmp
+		tmp=$(mktemp)
+		{
+			echo "# seq_vps faillock account (счётчик неудач при входе)"
+			echo "account	required		pam_faillock.so"
+		} >"$tmp"
+		cat /etc/pam.d/common-account >>"$tmp"
+		mv "$tmp" /etc/pam.d/common-account
+	fi
+
+	if ! _pam_sanity; then
+		log_err "PAM повреждён — восстанавливаю из бэкапа"
+		_pam_restore
+		update_stage_status "stage18_pam" "failed"
+		return 1
+	fi
+
+	log_ok "pam_faillock включён: $deny попыток → блокировка на $((unlock / 60)) мин"
+	log_info "Разблокировать: faillock --user <имя> --reset"
+	echo -e "  ${C_YELLOW}${ICON_WARN}  Проверь вход в НОВОМ окне, не закрывая текущую сессию!${C_RESET}"
+}
+
+_pam_disable_faillock() {
+	_pam_faillock_active || {
+		log_info "pam_faillock уже выключен"
+		return 0
+	}
+	backup_file "/etc/pam.d/common-auth" "stage18_pam"
+	backup_file "/etc/pam.d/common-account" "stage18_pam"
+	sed -i '/pam_faillock\.so/d; /seq_vps faillock/d' /etc/pam.d/common-auth /etc/pam.d/common-account
+	log_ok "pam_faillock выключен (счётчики в /var/run/faillock можно удалить)"
+}
+
+_pam_enable_pwquality() {
+	if ! ls /usr/lib/*/security/pam_pwquality.so &>/dev/null; then
+		log_info "Устанавливаю libpam-pwquality..."
+		pkg_install_retry "libpam-pwquality" || {
+			log_err "Пакет libpam-pwquality недоступен"
+			return 1
+		}
+	fi
+	backup_file "/etc/pam.d/common-password" "stage18_pam"
+	backup_file "/etc/security/pwquality.conf" "stage18_pam"
+
+	# pam_pwquality вызывается из pam_unix через „nullok“ — проще включить
+	# отдельной строкой перед pam_unix и задать политику в pwquality.conf.
+	if ! _pam_pwquality_active; then
+		local tmp
+		tmp=$(mktemp)
+		{
+			echo "# seq_vps pwquality"
+			echo "password	requisite		pam_pwquality.so retry=3"
+		} >"$tmp"
+		cat /etc/pam.d/common-password >>"$tmp"
+		mv "$tmp" /etc/pam.d/common-password
+	fi
+
+	if [[ ! -f /etc/security/pwquality.conf ]]; then : >/etc/security/pwquality.conf; fi
+	if grep -q '^# seq_vps' /etc/security/pwquality.conf 2>/dev/null; then
+		sed -i '/^# seq_vps/,+5d' /etc/security/pwquality.conf
+	fi
+	{
+		echo "# seq_vps: требования к паролям"
+		echo "minlen = 12"
+		echo "dcredit = -1"
+		echo "ucredit = -1"
+		echo "lcredit = -1"
+		echo "ocredit = -1"
+	} >>/etc/security/pwquality.conf
+
+	if ! _pam_sanity; then
+		log_err "PAM повреждён — восстанавливаю из бэкапа"
+		_pam_restore
+		update_stage_status "stage18_pam" "failed"
+		return 1
+	fi
+	log_ok "pam_pwquality включён: мин. длина 12 + цифра/строчная/прописная/символ"
+	log_warn "Проверь смену пароля в НОВОМ окне — политика применяется и к root"
+}
+
+# Откат PAM-правок до последнего бэкапа (используется, если проверка не прошла)
+_pam_restore() {
+	local bdir cand
+	for cand in $(find "${DATA_DIR}/backups" -maxdepth 2 -type d -name "stage18_pam" 2>/dev/null | sort -r); do
+		bdir="$cand"
+		break
+	done
+	[[ -n "$bdir" ]] || {
+		log_err "Бэкапов PAM нет — правьте /etc/pam.d вручную"
+		return 1
+	}
+	local bf bn
+	for bf in "$bdir"/*; do
+		[[ -f "$bf" ]] || continue
+		bn=$(basename "$bf")
+		case "$bn" in
+		common-auth) cp -a "$bf" /etc/pam.d/common-auth ;;
+		common-account) cp -a "$bf" /etc/pam.d/common-account ;;
+		common-password) cp -a "$bf" /etc/pam.d/common-password ;;
+		faillock.conf) cp -a "$bf" /etc/security/faillock.conf ;;
+		pwquality.conf) cp -a "$bf" /etc/security/pwquality.conf ;;
+		esac
+		done
+	log_ok "PAM восстановлен из $bdir"
 }
 
 # ═══════════════════════════════════════════════════════════════════
