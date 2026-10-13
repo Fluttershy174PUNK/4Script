@@ -55,6 +55,8 @@ readonly SSHD_CONFIG_D="/etc/ssh/sshd_config.d"
 # лежит 50-cloud-init.conf с PasswordAuthentication yes, который перебьёт 99-*.
 readonly SEQ_SSHD_DROPIN="00-seq-vps.conf"
 CURRENT_SSH_PORT=22
+# Порт, который надо закрыть в фаерволе после успешного рестарта SSH
+_wanted_close_port=""
 SSH_KEY_USER=""
 TERM_WIDTH=${COLUMNS:-80}
 SPINNER_PID=""
@@ -1141,20 +1143,45 @@ _ssh_socket_active() {
 	return 1
 }
 
-# Порт сокета. ListenStream= без значения сбрасывает базовый 22 из ssh.socket,
-# иначе override добавит второй слушатель и старый порт останется открыт.
+# Порт в сокет-активации. Двух вещей мало:
+#  1) override в ssh.socket.d с ListenStream= не поможет: sshd-socket-generator
+#     собирает ListenStream из ВСЕХ директив Port в sshd_config.d/*, а
+#     дропин-файл юнита применяется раньше сгенерированного файла,
+#     поэтому старый порт всё равно продолжит слушаться;
+#  2) недостаточно создать свой файл — соседний «10-port.conf»
+#     (его пишет cloud-init/провайдер) задаёт прежний порт и он тоже попадает в генератор.
+# Поэтому: явный Port в drop-in + замена всех чужих Port-файлов (бэкап сохранён).
 _ssh_socket_port() {
 	local port="$1"
+	systemctl is-active --quiet ssh.socket 2>/dev/null || return 0
+
+   # 1. новое значение в сокете (сброс предыдущих ListenStream)
 	local dir="/etc/systemd/system/ssh.socket.d"
 	local f="$dir/10-seq-vps.conf"
 	mkdir -p "$dir"
 	backup_file "$f" "stage5_ssh_config"
 	cat >"$f" <<EOF
-# seq_vps: порт сокет-активации (ListenStream= сбрасывает дефолтный 22)
+# seq_vps: порт сокет-активации
 [Socket]
 ListenStream=
 ListenStream=$port
 EOF
+
+	# 2. убрать чужие Port из drop-in каталога sshd: иначе генератор добавит их снова
+	local pc f_base st
+	shopt -s nullglob
+	for pc in "$SSHD_CONFIG_D"/*.conf; do
+		f_base=$(basename "$pc")
+		[[ "$f_base" == "$SEQ_SSHD_DROPIN" ]] && continue
+		grep -qE '^[[:space:]]*Port[[:space:]]' "$pc" 2>/dev/null || continue
+		st="stage5_ssh_config"
+		backup_file "$pc" "$st"
+		# закомментировать, а не удалять: файл может принадлежать провайдеру
+		sed -i 's/^[[:space:]]*Port[[:space:]]/# seq_vps: отключено (порт перенесён в 00-seq-vps.conf): &/I' "$pc"
+		log_info "Порт в $f_base отключён (иначе слушался бы параллельно)"
+	done
+	shopt -u nullglob
+
 	systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -1191,24 +1218,60 @@ _ssh_restart() {
 	fi
 	log_ok "SSH перезапущен ($SSH_SERVICE)"
 	sleep 2
-	local listen=""
-	if command -v ss &>/dev/null; then
-		listen=$(ss -tln 2>/dev/null | grep -c ":${CURRENT_SSH_PORT} ")
-	elif command -v netstat &>/dev/null; then
-		listen=$(netstat -tln 2>/dev/null | grep -c ":${CURRENT_SSH_PORT} ")
-	fi
-	if [[ "$listen" == "0" ]]; then
+	# Какие порты SSH реально слушает сейчас (из ядра, а не из файлов)
+	_ssh_listen_ports
+	if [[ " $_seen_ports " == *" ${CURRENT_SSH_PORT} "* ]]; then
+		log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
+	else
 		if _ssh_socket_active; then
 			log_warn "Порт $CURRENT_SSH_PORT не слушается — проверьте: systemctl cat ssh.socket"
 		else
 			log_warn "Не удалось проверить порт $CURRENT_SSH_PORT"
 		fi
-		if _ssh_socket_active && ! systemctl cat ssh.socket 2>/dev/null | grep -q "$CURRENT_SSH_PORT"; then
-			log_warn "ssh.socket не знает о порте $CURRENT_SSH_PORT — включите его через пункт 1"
-		fi
-	else
-		log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
 	fi
+	# Порт, оставшийся от прежних настроек — фактически открытая дверь:
+	# sshd-socket-generator делает ListenStream из КАЖДОЙ директивы Port в sshd_config.d/*.
+	local extra=""
+	for p in $_seen_ports; do
+		[[ "$p" == "$CURRENT_SSH_PORT" ]] && continue
+		extra+="$p "
+	done
+	[[ -n "$extra" ]] && log_warn "Кроме $CURRENT_SSH_PORT слушаются порты ${extra% } — уберите чужие 'Port' из $SSHD_CONFIG_D"
+
+	# Прежний порт закрываем только теперь, когда новый точно работает:
+	# до рестарта он был единственной дверью на случай провала.
+	if [[ -n "${_wanted_close_port:-}" && "$_wanted_close_port" != "$CURRENT_SSH_PORT" ]]; then
+		_fw_close_ssh_port "$_wanted_close_port"
+		_wanted_close_port=""
+	fi
+}
+
+# Какие SSH-порты реально слушаются (в _seen_ports — список через пробел).
+# Кандидаты — из конфига sshd и из сокета, результат пересечён с живыми
+# слушателями: только так видны «висящие» порты и нет ложных срабатываний
+# на DNS/mDNS и прочих чужих портах.
+_ssh_listen_ports() {
+	_seen_ports=""
+	local p candidates=""
+
+	while read -r p; do
+		[[ -n "$p" ]] && candidates+="$p"$'\n'
+	done < <(sshd -T 2>/dev/null | awk 'tolower($1) == "port" {print $2}')
+
+	if _ssh_socket_active; then
+		while read -r p; do
+			[[ -n "$p" ]] && candidates+="$p"$'\n'
+		done < <({ systemctl show ssh.socket -p Listen 2>/dev/null; systemctl cat ssh.socket 2>/dev/null; } |
+			grep -oE '(Listen|ListenStream)=([^ ]+ )?[^ ]*:[0-9]+|[0-9]+$' | grep -oE '[0-9]+$')
+	fi
+
+	# пересечение «что объявлено» × «что слушается»
+	local live
+	live=" $(ss -tln 2>/dev/null | awk 'NR>1 {print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ') "
+	while read -r p; do
+		[[ -n "$p" ]] && [[ "$live" == *" $p "* ]] && _seen_ports+="$p "
+	done <<<"$(sort -u <<<"$candidates")"
+	_seen_ports=$(tr ' ' '\n' <<<"$_seen_ports" | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ')
 }
 
 # AuthorizedKeysFile внутри Match-блока SFTP. Идемпотентно: повторный выбор
@@ -1226,6 +1289,60 @@ _sftp_add_authorized_keys() {
 		return 1
 	fi
 	mv "$tmp" "$cfg"
+}
+
+# Открыть порт SSH в активном фаерволе. Менять порт, не открыв его, —
+# гарантированная потеря доступа: sshd уже слушает новый порт, а фаервол
+# его режет. Возвращает 0, если фаервол неактивен (тогда блокировать нечем).
+_fw_allow_ssh_port() {
+	local port="$1"
+	if [[ "$(_fw_cmd)" == firewalld ]]; then
+		command -v firewall-cmd &>/dev/null || return 0
+		firewall-cmd --state 2>/dev/null | grep -q running || return 0
+		firewall-cmd --permanent --add-port="${port}/tcp" &>/dev/null || return 1
+		firewall-cmd --reload &>/dev/null || return 1
+		log_ok "Фаервол firewalld: порт $port/tcp открыт"
+		return 0
+	fi
+	command -v ufw &>/dev/null || return 0
+	ufw status 2>/dev/null | grep -q "Status: active" || return 0
+	ufw allow "${port}/tcp" comment "SSH" &>/dev/null || return 1
+	log_ok "Фаервол UFW: порт $port/tcp открыт"
+}
+
+# Закрыть прежний SSH-порт в фаерволе. Правило ufw удаляем целиком (cause
+# «SSH»), для firewalld — убираем порт; если команда не проходит — просто предупреждаем:
+# оставить лишнее правило безопаснее, чем потерять доступ к серверу.
+_fw_close_ssh_port() {
+	local port="$1"
+	[[ -n "$port" ]] || return 0
+	if [[ "$(_fw_cmd)" == firewalld ]]; then
+		command -v firewall-cmd &>/dev/null || return 0
+		firewall-cmd --state 2>/dev/null | grep -q running || return 0
+		firewall-cmd --permanent --remove-port="${port}/tcp" &>/dev/null || {
+			log_warn "Не удалось закрыть $port/tcp в firewalld — закройте вручную"
+			return 0
+		}
+		firewall-cmd --reload &>/dev/null || true
+		log_info "Фаервол firewalld: порт $port/tcp закрыт"
+		return 0
+	fi
+	command -v ufw &>/dev/null || return 0
+	ufw status 2>/dev/null | grep -q "Status: active" || return 0
+	# У одного порта две строки (IPv4 и IPv6), и удаление сдвигает нумерацию,
+	# поэтому собираем все номера и удаляем от большего к меньшему.
+	# В выводе номер печатается как «[ 1]» — с выравниванием пробелами.
+	local n removed=0
+	while read -r n; do
+		[[ -n "$n" ]] || continue
+		ufw --force delete "$n" &>/dev/null && removed=$((removed + 1))
+	done < <(ufw status numbered 2>/dev/null | grep -E "^\[ *[0-9]+\].*${port}/tcp" |
+		sed -n 's/^\[ *\([0-9]\+\)\].*/\1/p' | sort -rn)
+	if [[ $removed -gt 0 ]]; then
+		log_info "Фаервол UFW: правило $port/tcp закрыто ($removed шт.)"
+	else
+		log_warn "Не удалось закрыть правило для $port/tcp — проверьте: ufw status numbered"
+	fi
 }
 
 # Фаервол: на RHEL-семействе нативный firewalld, не ufw (конфликтуют на netfilter)
@@ -1346,13 +1463,25 @@ stage_ssh_config() {
 			log_err "Порт должен быть 1024-65535"
 			return 1
 		}
+		local old_port=$CURRENT_SSH_PORT
 		_ssh_apply "Порт → $np" "Port=$np" || return 1
 		_selinux_ssh_port "$np"
 		if _ssh_socket_active; then
 			_ssh_socket_port "$np"
 			log_info "Сокет-активация (ssh.socket) — порт прописан и в сокете"
 		fi
+		# Порядок важен: сначала открыть новый порт в фаерволе, потом менять
+		# sshd, иначе между рестартом и правилом сервер недоступен.
+		if ! _fw_allow_ssh_port "$np"; then
+			log_err "Не удалось открыть порт $np в фаерволе — смена отменена"
+			_ssh_apply "Порт → $old_port" "Port=$old_port" >/dev/null 2>&1 || true
+			if _ssh_socket_active; then _ssh_socket_port "$old_port" >/dev/null 2>&1 || true; fi
+			return 1
+		fi
 		CURRENT_SSH_PORT=$np
+		# Старый порт закрываем только после успешного рестарта — отложенно,
+		# чтобы при провале осталась рабочая дверь (см. _ssh_restart).
+		_wanted_close_port=$old_port
 		;;
 	2)
 		echo "  1) yes  2) no"
