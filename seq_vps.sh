@@ -1292,6 +1292,75 @@ _sftp_add_authorized_keys() {
 	mv "$tmp" "$cfg"
 }
 
+# Аудит правил sudo. Доп. файлы в /etc/sudoers.d — любимый способ тихой
+# эскалации: NOPASSWD, лишние команды, root-эквиваленты вроде chmod/chown/vi.
+_audit_sudoers() {
+	echo ""
+	echo -e "${C_BOLD}▸ Синтаксис sudoers:${C_RESET}"
+	if visudo -c 2>&1 | tee -a "$LOG_FILE"; then
+		log_ok "visudo -c: ошибок нет"
+	else
+		log_err "visudo -c нашёл ошибку — проверьте правила вручную"
+	fi
+
+	echo ""
+	echo -e "${C_BOLD}▸ Файлы правил:${C_RESET}"
+	local f n
+	shopt -s nullglob
+	for f in /etc/sudoers /etc/sudoers.d/*; do
+		[[ -f "$f" ]] || continue
+		# README из пакета sudo правил не содержит
+		[[ "$(basename "$f")" == "README" ]] && continue
+		n=$(grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null || echo 0)
+		printf '  %s (%s строк правил)\n' "$f" "$n"
+	done
+	shopt -u nullglob
+
+	# CVE-2025-32463 (эскалация через sudo --chroot) закрыт в 1.9.17p1.
+	# Внимание: Ubuntu 26.04 ставит sudo-rs — другая реализация и другая
+	# нумерация (0.2.x), сравнивать её с 1.9.x нельзя: 0.2.13 < 1.9.17p1
+	# дало бы ложное «уязвим».
+	local vline
+	vline=$(sudo -V 2>/dev/null | head -1 || true)
+	if [[ -n "$vline" ]]; then
+		echo ""
+		echo -e "  ${C_DIM}$vline${C_RESET}"
+		if [[ "$vline" == *sudo-rs* ]]; then
+			if printf '0.2.4\n%s\n' "${vline#sudo-rs }" | sort -V -C; then
+				echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  sudo-rs с CVE-2025-32463 не подвержен (--chroot не поддерживается)"
+			else
+				echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  Старый sudo-rs — обновите пакет sudo-rs"
+			fi
+		else
+			local v
+			v=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+[a-z0-9]*' <<<"$vline")
+			if printf '1.9.17p1\n%s\n' "$v" | sort -V -C; then
+				echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  sudo $v (CVE-2025-32463 закрыт)"
+			else
+				echo -e "  ${C_RED}${ICON_WARN}${C_RESET}  sudo $v < 1.9.17p1 — есть LPE CVE-2025-32463, обновите пакет"
+			fi
+		fi
+	fi
+
+	echo ""
+	echo -e "${C_BOLD}▸ Подозрительные правила (NOPASSWD / оболочки / редакторы):${C_RESET}"
+	local hits
+	hits=$(grep -rnE 'NOPASSWD|/bin/(ba|z|k|c)?sh$|/usr/bin/(vi|vim|nano|less|man|find|awk|python[0-9.]*)$|ALL[[:space:]]*=[[:space:]]*ALL' \
+		/etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+	if [[ -n "$hits" ]]; then
+		echo "$hits" | sed 's/^/  /' | head -20
+		log_warn "Каждое такое правило фактически даёт root — проверьте, что оно нужно"
+	else
+		echo -e "  ${C_DIM}ничего похожего не найдено${C_RESET}"
+	fi
+
+	echo ""
+	echo -e "  ${C_DIM}Отключить всё содержимое /etc/sudoers.d можно переносом файлов,
+  но сначала проверьте: часть правил может быть нужна для работы сервисов.${C_RESET}"
+	echo ""
+	read -rp "  Enter..." _
+}
+
 # Открыть порт SSH в активном фаерволе. Менять порт, не открыв его, —
 # гарантированная потеря доступа: sshd уже слушает новый порт, а фаервол
 # его режет. Возвращает 0, если фаервол неактивен (тогда блокировать нечем).
@@ -1823,6 +1892,24 @@ stage_ufw() {
 	backup_file "/etc/default/ufw" "stage7_ufw"
 	backup_file "/etc/ufw/ufw.conf" "stage7_ufw"
 
+	# IPv6=no — тихая дыра: правила UFW не покрывают IPv6, а сервер с
+	# AAAA-записью остаётся доступным по всем портам в обход фаервола.
+	if grep -qE '^IPV6=no' /etc/default/ufw 2>/dev/null; then
+		log_warn "UFW отключён IPv6 (IPV6=no) — правила не действуют для IPv6"
+		if confirm "Включить фильтрацию IPv6 (IPV6=yes)?"; then
+			sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+			ufw reload &>/dev/null || true
+			log_ok "IPV6=yes — правила UFW теперь покрывают и IPv6"
+		fi
+	fi
+
+	# Docker публикует порты напрямую в netfilter (цепочка DOCKER-USER),
+	# поэтому правила UFW на них не действуют — контейнеры видны извне.
+	if command -v docker &>/dev/null; then
+		log_warn "Установлен Docker: опубликованные порты обходят правила UFW"
+		log_info "  ограничить: правила в цепочке DOCKER-USER или ufw-docker"
+	fi
+
 	_ssh_port_refresh
 	local sp=$CURRENT_SSH_PORT
 
@@ -1841,6 +1928,7 @@ stage_ufw() {
 		echo "  2) HTTP+HTTPS     6) Отключить"
 		echo "  3) Произв. порт   7) Сбросить всё"
 		echo "  4) Удалить        8) Справка"
+		echo "  9) Аудит sudo-правил"
 		echo "  S) Завершить"
 		echo ""
 		read -rp "  ${ICON_ARROW} " ua
@@ -1866,6 +1954,9 @@ stage_ufw() {
 			read -rp "  Комментарий: " comment
 			[[ -n "$comment" ]] && ufw allow "${cp}/${proto}" comment "$comment" || ufw allow "${cp}/${proto}"
 			log_ok "Порт $cp/$proto открыт"
+			;;
+		9)
+			_audit_sudoers
 			;;
 		4)
 			ufw status numbered 2>/dev/null
