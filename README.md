@@ -133,14 +133,18 @@ alone still lets PAM admit a password through keyboard-interactive
 authentication, so `KbdInteractiveAuthentication no` is set together with it
 (and removed together with it).
 
-**Validation before every restart — and before every write.** A change to the
-SSH drop-in is built in a temporary file and checked with `sshd -t` *before* it
-replaces the real file, so a rejected value never reaches the live config. The
-probe is `Include <candidate>` plus the real `sshd_config`: a bare drop-in
-cannot be validated on its own, since without `HostKey` sshd always fails and
-the result also depends on the neighbouring files. A rejected change leaves the
-file untouched and reports which value failed. `sshd -t` also runs before each
-`systemctl restart ssh`, including the two restarts in the SFTP stage.
+**Validation before every write.** Every SSH setting changed from the menu is
+built in a temporary file and checked with `sshd -t` *before* it replaces the
+real file, so a rejected value never reaches the live config. A menu item
+reports success only when every value it set was accepted; otherwise it fails,
+leaves the file untouched and names the value that was rejected. The probe is
+`Include <candidate>` plus the real `sshd_config`: a bare drop-in cannot be
+validated on its own, since without `HostKey` sshd always fails and the result
+also depends on the neighbouring files. The same check guards adding
+`Include` to `sshd_config` and writing the SFTP `Match` block.
+
+`sshd -t` also runs before each `systemctl restart ssh`, including the two
+restarts in the SFTP stage.
 
 **Root login.** `PermitRootLogin prohibit-password` (the safe option) is the
 default in the menu; `yes` requires an explicit second confirmation.

@@ -1181,6 +1181,23 @@ _ssh_restart() {
 	fi
 }
 
+# AuthorizedKeysFile внутри Match-блока SFTP. Идемпотентно: повторный выбор
+# ключа не добавляет строку второй раз.
+_sftp_add_authorized_keys() {
+	local cfg="$1" line="    AuthorizedKeysFile /etc/ssh/keys.d/%u.pub"
+	grep -qF "$line" "$cfg" && return 0
+	local tmp
+	tmp=$(mktemp)
+	cp "$cfg" "$tmp"
+	printf '%s\n' "$line" >>"$tmp"
+	if ! _sshd_config_ok "$tmp"; then
+		log_err "AuthorizedKeysFile не проходит sshd -t — конфиг не изменён"
+		rm -f "$tmp"
+		return 1
+	fi
+	mv "$tmp" "$cfg"
+}
+
 # Фаервол: на RHEL-семействе нативный firewalld, не ufw (конфликтуют на netfilter)
 _fw_cmd() {
 	[[ "$PKG_MGR" == dnf || "$PKG_MGR" == yum ]] && echo firewalld || echo ufw
@@ -1194,16 +1211,22 @@ stage_ssh_config() {
 		chmod 755 "$SSHD_CONFIG_D"
 	}
 
+	backup_file "/etc/ssh/sshd_config" "stage5_ssh_config"
 	if ! grep -q "^Include $SSHD_CONFIG_D" /etc/ssh/sshd_config 2>/dev/null; then
-		backup_file "/etc/ssh/sshd_config" "stage5_ssh_config"
 		local tf
 		tf=$(mktemp)
-		echo "Include $SSHD_CONFIG_D/*.conf" >"$tf"
-		cat /etc/ssh/sshd_config >>"$tf"
+		# candidates содержит и старый конфиг (с HostKey), поэтому sshd -t -f его принимает
+		{
+			echo "Include $SSHD_CONFIG_D/*.conf"
+			cat /etc/ssh/sshd_config 2>/dev/null
+		} >"$tf"
+		if ! sshd -t -f "$tf" 2>&1 | tee -a "$LOG_FILE"; then
+			log_err "sshd_config с Include не проходит sshd -t — файл не изменён"
+			rm -f "$tf"
+			return 1
+		fi
 		mv "$tf" /etc/ssh/sshd_config
 		log_info "Include $SSHD_CONFIG_D → sshd_config"
-	else
-		backup_file "/etc/ssh/sshd_config" "stage5_ssh_config"
 	fi
 
 	local cfg="$SSHD_CONFIG_D/$SEQ_SSHD_DROPIN"
@@ -1233,6 +1256,20 @@ stage_ssh_config() {
 			return 1
 		fi
 		mv "$tmp" "$cfg"
+	}
+
+	# Правка drop-in с отчётом: «готово» печатает только если приняты все значения,
+	# иначе пункт меню возвращает 1 и не даёт вызывающему коду считать шаг выполненным.
+	_ssh_apply() {
+		local label="$1" kv
+		shift
+		for kv in "$@"; do
+			_ssh_set "${kv%%=*}" "${kv#*=}" || {
+				log_err "$label: не применено"
+				return 1
+			}
+		done
+		log_ok "$label"
 	}
 
 	local sc
@@ -1272,47 +1309,43 @@ stage_ssh_config() {
 			log_err "Порт должен быть 1024-65535"
 			return 1
 		}
-		_ssh_set "Port" "$np"
+		_ssh_apply "Порт → $np" "Port=$np" || return 1
 		_selinux_ssh_port "$np"
 		if _ssh_socket_active; then
 			_ssh_socket_port "$np"
 			log_info "Сокет-активация (ssh.socket) — порт прописан и в сокете"
 		fi
 		CURRENT_SSH_PORT=$np
-		log_ok "Порт → $np"
 		;;
 	2)
 		echo "  1) yes  2) no"
 		read -rp "  ${ICON_ARROW} " c
 		[[ "$c" == "2" ]] && {
-			_ssh_set "PasswordAuthentication" "no"
-			# без этого пароль всё равно принимается через PAM (keyboard-interactive)
-			_ssh_set "KbdInteractiveAuthentication" "no"
-			log_ok "Парольный вход отключён (password + keyboard-interactive)"
+			# без KbdInteractive пароль всё равно принимается через PAM
+			_ssh_apply "Парольный вход отключён (password + keyboard-interactive)" \
+				"PasswordAuthentication=no" "KbdInteractiveAuthentication=no" || return 1
 			echo -e "  ${C_YELLOW}${ICON_WARN}  Убедитесь, что SSH-ключ установлен!${C_RESET}"
 		}
 		[[ "$c" == "1" ]] && {
-			_ssh_set "PasswordAuthentication" "yes"
-			_ssh_set "KbdInteractiveAuthentication" "yes"
-			log_ok "Парольный вход включён"
+			_ssh_apply "Парольный вход включён" \
+				"PasswordAuthentication=yes" "KbdInteractiveAuthentication=yes" || return 1
 		}
 		;;
 	3)
 		echo "  1) prohibit-password (рекомендуется)  2) no  3) yes (небезопасно)"
 		read -rp "  ${ICON_ARROW} " c
 		case "$c" in
-		1 | "") _ssh_set "PermitRootLogin" "prohibit-password" ;;
-		2) _ssh_set "PermitRootLogin" "no" ;;
+		1 | "") _ssh_apply "PermitRootLogin → prohibit-password" "PermitRootLogin=prohibit-password" || return 1 ;;
+		2) _ssh_apply "PermitRootLogin → no" "PermitRootLogin=no" || return 1 ;;
 		3)
 			echo -e "  ${C_RED}${ICON_WARN}  Прямой вход root по паролю/ключу — самый частый вектор атак.${C_RESET}"
 			confirm "Точно включить PermitRootLogin yes?" || {
 				log_info "Отменено"
 				return 0
 			}
-			_ssh_set "PermitRootLogin" "yes"
+			_ssh_apply "PermitRootLogin → yes" "PermitRootLogin=yes" || return 1
 			;;
 		esac
-		log_ok "PermitRootLogin изменён"
 		;;
 	4)
 		read -rp "  Макс. попыток (1-10): " nm
@@ -1320,18 +1353,16 @@ stage_ssh_config() {
 			log_err "1-10"
 			return 1
 		}
-		_ssh_set "MaxAuthTries" "$nm"
-		log_ok "MaxAuthTries → $nm"
+		_ssh_apply "MaxAuthTries → $nm" "MaxAuthTries=$nm" || return 1
 		;;
 	5)
 		echo "  1) no (рекомендуется)  2) yes"
 		read -rp "  ${ICON_ARROW} " c
 		[[ "$c" == "1" ]] && {
-			_ssh_set "PermitEmptyPasswords" "no"
-			log_ok "Пустые пароли запрещены"
+			_ssh_apply "Пустые пароли запрещены" "PermitEmptyPasswords=no" || return 1
 		}
 		[[ "$c" == "2" ]] && {
-			_ssh_set "PermitEmptyPasswords" "yes"
+			_ssh_apply "PermitEmptyPasswords yes" "PermitEmptyPasswords=yes" || return 1
 			echo -e "  ${C_RED}${ICON_WARN}  Небезопасно!${C_RESET}"
 		}
 		;;
@@ -1404,7 +1435,9 @@ stage_sftp_user() {
 	local sftp_cfg="$SSHD_CONFIG_D/98-sftp-$sfu.conf"
 	backup_file "$sftp_cfg" "stage6_sftp_user"
 	backup_file "/etc/ssh/sshd_config" "stage6_sftp_user"
-	cat >"$sftp_cfg" <<EOF
+	local new_cfg
+	new_cfg=$(mktemp)
+	cat >"$new_cfg" <<EOF
 # SFTP: $sfu (seq_vps)
 Match User $sfu
     ForceCommand internal-sftp
@@ -1415,6 +1448,14 @@ Match User $sfu
     X11Forwarding no
     PasswordAuthentication yes
 EOF
+	if ! _sshd_config_ok "$new_cfg"; then
+		log_err "Конфиг SFTP не проходит sshd -t"
+		rm -f "$new_cfg"
+		userdel "$sfu" 2>/dev/null || true
+		rm -rf "$chroot_dir"
+		return 1
+	fi
+	mv "$new_cfg" "$sftp_cfg"
 	chmod 644 "$sftp_cfg"
 
 	if ! _ssh_validate; then
@@ -1446,8 +1487,7 @@ EOF
 			mkdir -p /etc/ssh/keys.d
 			echo "$pk" >"/etc/ssh/keys.d/$sfu.pub"
 			chmod 600 "/etc/ssh/keys.d/$sfu.pub"
-			echo "    AuthorizedKeysFile /etc/ssh/keys.d/%u.pub" >>"$sftp_cfg"
-			_ssh_validate && _ssh_restart && log_ok "Ключ установлен"
+			_sftp_add_authorized_keys "$sftp_cfg" && _ssh_restart && log_ok "Ключ установлен"
 		}
 		;;
 	2)
@@ -1468,8 +1508,7 @@ EOF
 				mkdir -p /etc/ssh/keys.d
 				cp "$sh/.ssh/authorized_keys" "/etc/ssh/keys.d/$sfu.pub"
 				chmod 600 "/etc/ssh/keys.d/$sfu.pub"
-				echo "    AuthorizedKeysFile /etc/ssh/keys.d/%u.pub" >>"$sftp_cfg"
-				_ssh_validate && _ssh_restart && log_ok "Ключ от $su скопирован"
+				_sftp_add_authorized_keys "$sftp_cfg" && _ssh_restart && log_ok "Ключ от $su скопирован"
 			fi
 		}
 		;;
