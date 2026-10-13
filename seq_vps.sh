@@ -93,6 +93,7 @@ readonly STAGE_DEFS=(
 	"14|stage14_disk|💾|Мониторинг диска и большие файлы|system|stage_disk"
 	"15|stage15_bbr|🚀|BBR congestion control|system|stage_bbr"
 	"16|stage16_sysctl|🧩|Харденинг ядра (sysctl)|system|stage_sysctl"
+	"17|stage17_audit|🔎|Аудит: порты, учётки, SUID, LSM|system|stage_audit"
 )
 readonly CATEGORY_ORDER=(setup access protect system)
 
@@ -2766,6 +2767,124 @@ stage_sysctl() {
 	fi
 
 	update_stage_status "stage16_sysctl" "completed"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 17: АУДИТ (только чтение, ничего не меняет)
+# ═══════════════════════════════════════════════════════════════════
+
+# Что слушает наружу, какие учётки опасны, какие файлы дают root и в каком
+# состоянии LSM. Всё только читается — этап безопасно запускать на живом сервере.
+stage_audit() {
+	stage_banner "🔎" "17" "Аудит: порты, учётки, SUID, LSM"
+
+	# ── Прослушиваемые порты ──
+	echo -e "${C_BOLD}▸ Слушают порты:${C_RESET}"
+	if command -v ss &>/dev/null; then
+		ss -tulpn 2>/dev/null | awk 'NR==1 || $1 == "tcp" || $1 == "udp"' | head -25 | sed 's/^/  /'
+	else
+		echo -e "  ${C_DIM}ss не найден${C_RESET}"
+	fi
+
+	# Порты, открытые в фаерволе, для сопоставления
+	local fw_list=""
+	if [[ "$(_fw_cmd)" == firewalld ]] && command -v firewall-cmd &>/dev/null; then
+		fw_list=$(firewall-cmd --list-ports 2>/dev/null; firewall-cmd --list-services 2>/dev/null)
+	elif command -v ufw &>/dev/null; then
+		fw_list=$(ufw status 2>/dev/null | grep -oE '[0-9]+/(tcp|udp)')
+	fi
+	[[ -n "$fw_list" ]] && {
+		echo ""
+		echo -e "  ${C_DIM}Разрешено фаерволом: $(tr '\n' ' ' <<<"$fw_list")${C_RESET}"
+	}
+
+	# ── Учётные записи ──
+	echo ""
+	echo -e "${C_BOLD}▸ Учётные записи:${C_RESET}"
+	local extra_root
+	extra_root=$(awk -F: '$3 == 0 && $1 != "root" {print $1}' /etc/passwd)
+	if [[ -n "$extra_root" ]]; then
+		echo -e "  ${C_RED}${ICON_WARN}${C_RESET}  UID 0 кроме root: $(tr '\n' ' ' <<<"$extra_root") — это второй root"
+	else
+		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  UID 0 только у root"
+	fi
+
+	# Пустые пароли и заблокированные учётки с шеллом
+	local empty_pw=() users_with_shell=0 u st
+	while IFS=: read -r u _ uid _ _ _ sh; do
+		[[ $uid -ge 1000 && $uid -lt 65534 ]] || continue
+		[[ "$sh" == */nologin || "$sh" == */false ]] && continue
+		users_with_shell=$((users_with_shell + 1))
+		st=$(passwd -S "$u" 2>/dev/null | awk '{print $2}')
+		# NP = no password; L = locked
+		[[ "$st" == "NP" ]] && empty_pw+=("$u")
+	done </etc/passwd
+	if [[ ${#empty_pw[@]} -gt 0 ]]; then
+		echo -e "  ${C_RED}${ICON_WARN}${C_RESET}  Без пароля, но с шеллом: ${empty_pw[*]}"
+	else
+		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  Учёток без пароля с шеллом нет (проверено: $users_with_shell)"
+	fi
+
+	# Пользователи с sudo
+	local sudoers_list
+	sudoers_list=$(getent group "$SUDO_GROUP" 2>/dev/null | cut -d: -f4)
+	echo -e "  ${C_DIM}В группе $SUDO_GROUP: ${sudoers_list:-—}${C_RESET}"
+
+	# ── SUID/SGID ──
+	echo ""
+	echo -e "${C_BOLD}▸ Файлы с SUID/SGID (дают root при ошибке в них):${C_RESET}"
+	local suid_files
+	suid_files=$(find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | sort)
+	if [[ -n "$suid_files" ]]; then
+		local cnt
+		cnt=$(wc -l <<<"$suid_files")
+		echo "$suid_files" | sed 's/^/  /' | head -25
+		[[ $cnt -gt 25 ]] && echo -e "  ${C_DIM}… всего $cnt${C_RESET}"
+	else
+		echo -e "  ${C_DIM}не найдено${C_RESET}"
+	fi
+
+	# ── Мир-записываемые файлы вне /tmp ──
+	local ww
+	ww=$(find /etc /usr /var -xdev -type f -perm -0002 2>/dev/null | head -15)
+	if [[ -n "$ww" ]]; then
+		echo ""
+		echo -e "${C_BOLD}▸ Файлы, доступные на запись всем (вне /tmp):${C_RESET}"
+		echo "$ww" | sed 's/^/  /'
+	fi
+
+	# ── LSM / целостность ──
+	echo ""
+	echo -e "${C_BOLD}▸ Защита ядра и целостность:${C_RESET}"
+	if [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  SELinux: Enforcing"
+	elif command -v aa-status &>/dev/null; then
+		local aa
+		aa=$(aa-status 2>/dev/null | grep -E 'profiles are loaded|profiles are in enforce|profiles are in complain' | tr '\n' ' ')
+		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  AppArmor: ${aa:-активен}"
+	else
+		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  LSM (SELinux/AppArmor) не обнаружен"
+	fi
+
+	local tr_inst=false
+	command -v rkhunter &>/dev/null && tr_inst=true || true
+	command -v aide &>/dev/null && tr_inst=true || true
+	$tr_inst || echo -e "  ${C_DIM}Проверки целостности (rkhunter/aide) не установлены${C_RESET}"
+
+	if [[ "$PKG_MGR" == apt ]] && command -v debsums &>/dev/null; then
+		local changed
+		changed=$(debsums -s 2>/dev/null | head -10)
+		[[ -n "$changed" ]] && {
+			echo ""
+			echo -e "${C_BOLD}▸ Изменённые файлы пакетов (debsums):${C_RESET}"
+			echo "$changed" | sed 's/^/  /'
+		}
+	fi
+
+	echo ""
+	echo -e "  ${C_DIM}Этап только читает систему — ничего не изменено.${C_RESET}"
+	read -rp "  Enter..." _
+	update_stage_status "stage17_audit" "completed"
 }
 
 # ═══════════════════════════════════════════════════════════════════
