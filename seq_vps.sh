@@ -1255,36 +1255,44 @@ _ssh_restart() {
 	done
 	[[ -n "$extra" ]] && log_warn "Кроме $CURRENT_SSH_PORT слушаются порты ${extra% } — уберите чужие 'Port' из $SSHD_CONFIG_D"
 
-	# Прежний порт закрываем только когда новый подтверждён в двух местах:
-	# в ядре (слушается) и снаружи (TCP-соединение проходит через фаервол).
-	# Рестарт sshd сам по себе не доказывает доступность — по факту смены порта
-	# раньше именно на этом и терялся доступ.
+	# Прежний порт закрываем только после того, как новый реально пускает.
+	# Рестарт sshd этого не доказывает, а локальная проба видит только фаервол
+	# хоста (не NAT/security group). Поэтому решает пользователь: сначала
+	# понятная проба, затем явное подтверждение входа из новой сессии.
 	if [[ -n "${_wanted_close_port:-}" && "$_wanted_close_port" != "$CURRENT_SSH_PORT" ]]; then
+		local probe_ok=false
 		if $new_port_live && _ssh_port_reachable "$CURRENT_SSH_PORT"; then
+			probe_ok=true
+			log_ok "Локальная проба: порт $CURRENT_SSH_PORT принимает соединения (фаервол хоста пропускает)"
+		else
+			log_warn "Порт $CURRENT_SSH_PORT не отвечает на локальную пробу"
+		fi
+		log_warn "Проба не заменяет внешнюю проверку: NAT, security group и маршрутизация не видны изнутри"
+		echo -e "  ${C_BOLD}Проверьте вход в НОВОМ окне: ssh -p $CURRENT_SSH_PORT root@<адрес>${C_RESET}"
+		if $probe_ok && confirm "Вход по новому порту $CURRENT_SSH_PORT проверен? Закрыть старый $_wanted_close_port"; then
 			_fw_close_ssh_port "$_wanted_close_port"
 			_wanted_close_port=""
 		else
-			log_warn "Старый порт $_wanted_close_port оставлен открытым: новый порт $CURRENT_SSH_PORT ещё не подтверждён извне"
-			log_info "  Проверьте вход: ssh -p $CURRENT_SSH_PORT root@<адрес> — затем закройте старый порт в фаерволе"
+			log_warn "Старый порт $_wanted_close_port оставлен открытым"
+			log_info "  Закрыть вручную: ufw delete <номер>  /  firewall-cmd --permanent --remove-port=$_wanted_close_port/tcp"
 		fi
 	fi
 }
 
-# Доступен ли порт снаружи: пробуем установить TCP-соединение на свой адрес.
-# Локальная проверка не идеальна для удалённого клиента, но именно она
-# отличается «слушается» от «пускает фаервол/маршрут».
+# Локальная проба: проходит ли TCP-соединение на свой адрес (цепочка INPUT,
+# то есть фаервол хоста). Это НЕ проверка внешней доступности: NAT, security
+# group облака и маршрутизация остаются непроверенными.
+# Если проверить нечем — возвращаем ошибку, а не успех: ложное «доступен»
+# закрыло бы старый порт без основания.
 _ssh_port_reachable() {
 	local port="$1" ip
 	ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-	[[ -n "$ip" ]] || return 0
+	[[ -n "$ip" ]] || return 1
 	if command -v nc &>/dev/null; then
-		nc -z -w 3 "$ip" "$port" &>/dev/null && return 0
-	elif command -v timeout &>/dev/null; then
-		timeout 3 bash -c ": >/dev/tcp/$ip/$port" 2>/dev/null && return 0
-	else
-		return 0
+		nc -z -w 3 "$ip" "$port" &>/dev/null
+		return $?
 	fi
-	return 1
+	timeout 3 bash -c ": >/dev/tcp/$ip/$port" 2>/dev/null
 }
 
 # Какие SSH-порты реально слушаются (в _seen_ports — список через пробел).
