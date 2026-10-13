@@ -745,6 +745,10 @@ stage_users() {
 	case "${action,,}" in
 	c)
 		read -rp "  Имя пользователя: " username
+		[[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
+			log_err "Имя: латиница в нижнем регистре, цифры, _ и -"
+			return 1
+		}
 		id "$username" &>/dev/null && {
 			log_err "Уже существует: $username"
 			return 1
