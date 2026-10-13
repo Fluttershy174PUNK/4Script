@@ -3850,6 +3850,374 @@ show_profiles() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  УДАЛЁННЫЙ РЕЖИМ
+# ═══════════════════════════════════════════════════════════════════
+# Смысл: запустить настройку с ноутбука против удалённого сервера.
+# Пароль нужен ОДИН раз — чтобы установить SSH-ключ; дальше всё по ключу.
+# Сам прогон идёт внутри screen на сервере, поэтому обрыв связи клиента
+# не убивает настройку на середине этапа.
+
+REMOTE_USER=""
+REMOTE_HOST=""
+REMOTE_PORT="22"
+REMOTE_KEY=""
+REMOTE_SESSION="4script"
+REMOTE_ATTACH_ONLY=false
+REMOTE_SUDO=""
+
+_remote_ssh_opts() {
+	# BatchMode только для неинтерактивных проверок; для ssh-copy-id и attach
+	# он не подходит (нельзя ввести пароль).
+	printf '%s\0' -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30 \
+		-o ServerAliveCountMax=6 -p "$REMOTE_PORT"
+	if [[ "$1" == batch ]]; then
+		printf '%s\0' -o BatchMode=yes
+	fi
+}
+
+_remote_target() { printf '%s@%s' "$REMOTE_USER" "$REMOTE_HOST"; }
+
+# Парсит user@host, host, user@host:port, user@host@port (форма из запроса)
+remote_parse_target() {
+	local spec="$1"
+	# user@host@port — третий @ отделяет порт
+	if [[ "$spec" =~ ^([^@]+)@([^@]+)@([0-9]+)$ ]]; then
+		REMOTE_USER="${BASH_REMATCH[1]}"
+		REMOTE_HOST="${BASH_REMATCH[2]}"
+		REMOTE_PORT="${BASH_REMATCH[3]}"
+	elif [[ "$spec" =~ ^([^@]+)@([^:@]+):([0-9]+)$ ]]; then
+		REMOTE_USER="${BASH_REMATCH[1]}"
+		REMOTE_HOST="${BASH_REMATCH[2]}"
+		REMOTE_PORT="${BASH_REMATCH[3]}"
+	elif [[ "$spec" =~ ^([^@]+)@([^:@]+)$ ]]; then
+		REMOTE_USER="${BASH_REMATCH[1]}"
+		REMOTE_HOST="${BASH_REMATCH[2]}"
+	elif [[ "$spec" =~ ^([^:@]+):([0-9]+)$ ]]; then
+		REMOTE_HOST="${BASH_REMATCH[1]}"
+		REMOTE_PORT="${BASH_REMATCH[2]}"
+	elif [[ -n "$spec" ]]; then
+		REMOTE_HOST="$spec"
+	fi
+	[[ -n "$REMOTE_USER" ]] || REMOTE_USER="root"
+	# Пустая или нераспознанная спецификация не должна превращаться в адрес
+	# «root@root@» — отклоняем всё, что не похоже на имя хоста.
+	if [[ -z "$REMOTE_HOST" || ! "$REMOTE_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]]; then
+		echo "Ошибка: не удалось разобрать адрес сервера: '${1}'" >&2
+		echo "  Ожидается: [user@]host[:port] или user@host@port" >&2
+		return 1
+	fi
+	case "$REMOTE_USER" in
+	*[!A-Za-z0-9._@-]* | "")
+		echo "Ошибка: неправильное имя пользователя: '${REMOTE_USER}'" >&2
+		return 1
+		;;
+	esac
+	if [[ ! "$REMOTE_PORT" =~ ^[0-9]+$ ]] || ((REMOTE_PORT < 1 || REMOTE_PORT > 65535)); then
+		echo "Ошибка: неправильный порт: ${REMOTE_PORT}" >&2
+		return 1
+	fi
+	return 0
+}
+
+# Есть ли терминал для ввода пароля. При запуске из скрипта/CI stdin занят,
+# и ssh-copy-id вместо запроса пароля пытается запустить ssh-askpass и падает
+# с «No such file or directory» — непонятной ошибкой на ровном месте.
+remote_have_tty() {
+	[[ -c /dev/tty ]] && { exec 9<>/dev/tty; } 2>/dev/null || return 1
+	exec 9>&- 2>/dev/null
+	return 0
+}
+
+# Пароль спрашиваем с /dev/tty, а не со stdin: stdin может быть heredoc,
+# трубой или /dev/null, и тогда ssh-copy-id не сможет запросить пароль.
+remote_copy_id() {
+	local pub="$1"
+	if remote_have_tty; then
+		ssh-copy-id -i "$pub" -p "$REMOTE_PORT" -o StrictHostKeyChecking=accept-new "$(_remote_target)" </dev/tty
+	else
+		log_err "Нет терминала для ввода пароля (stdin перенаправлен)"
+		log_info "Варианты: запустить из интерактивного терминала, использовать уже"
+		log_info "  авторизованный ключ (--key) либо добавить ключ на сервер вручную"
+		return 1
+	fi
+}
+
+# Проверяет, пускает ли сервер уже по ключу (без пароля)
+remote_key_auth_works() {
+	local -a opts=()
+	while IFS= read -r -d '' o; do opts+=("$o"); done < <(_remote_ssh_opts batch)
+	local -a ka=()
+	[[ -n "$REMOTE_KEY" ]] && ka=(-i "$REMOTE_KEY" -o IdentitiesOnly=yes)
+	ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" 'exit 0' &>/dev/null
+}
+
+remote_run_remote() { # remote_run_remote '<команда>' [interactive|pipe]
+	local cmd="$1" mode="${2:-pipe}"
+	local -a opts=()
+	[[ "$mode" == pipe ]] && {
+		while IFS= read -r -d '' o; do opts+=("$o"); done < <(_remote_ssh_opts batch)
+	} || {
+		while IFS= read -r -d '' o; do opts+=("$o"); done < <(_remote_ssh_opts any)
+	}
+	local -a ka=()
+	[[ -n "$REMOTE_KEY" ]] && ka=(-i "$REMOTE_KEY" -o IdentitiesOnly=yes)
+	# shellcheck disable=SC2029 # удалённая команда должна собираться на клиенте
+	ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" "$cmd"
+}
+
+# Выбор ключа: список локальных публичных ключей или генерация нового
+remote_pick_key() {
+	local -a pubs=()
+	local f
+	shopt -s nullglob
+	for f in "$HOME"/.ssh/*.pub; do pubs+=("$f"); done
+	shopt -u nullglob
+
+	echo ""
+	echo -e "${C_BOLD}▸ SSH-ключи на этой машине:${C_RESET}"
+	local i=1
+	for f in "${pubs[@]:-}"; do
+		[[ -n "$f" ]] || continue
+		printf '  %2d) %-32s %s\n' "$i" "$(basename "$f")" "$(ssh-keygen -lf "$f" 2>/dev/null | awk '{print $1, $2}')"
+		i=$((i + 1))
+	done
+	[[ ${#pubs[@]} -eq 0 ]] && echo -e "  ${C_DIM}(публичных ключей нет)${C_RESET}"
+	echo ""
+	echo "  N) сгенерировать новый ключ"
+	[[ ${#pubs[@]} -gt 0 ]] && echo "  (номер) использовать существующий"
+	echo "  S) отмена"
+	read -rp "  ${ICON_ARROW} " ans
+
+	case "${ans,,}" in
+	n)
+		local name
+		read -rp "  Имя ключа [4script_ed25519]: " name
+		name=${name:-4script_ed25519}
+		local path="$HOME/.ssh/$name"
+		[[ -e "$path" ]] && {
+			log_err "Ключ $path уже существует"
+			return 1
+		}
+		local comment
+		read -rp "  Комментарий [$(whoami)@$(hostname -s)]: " comment
+		comment=${comment:-$(whoami)@$(hostname -s)}
+		mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+		log_info "Генерирую ed25519-ключ без парольной фразы..."
+		if ssh-keygen -q -t ed25519 -N '' -C "$comment" -f "$path"; then
+			REMOTE_KEY="$path"
+			log_ok "Ключ создан: $path"
+			log_info "Публичная часть: ${C_DIM}${path}.pub${C_RESET}"
+			return 0
+		fi
+		log_err "Не удалось создать ключ"
+		return 1
+		;;
+	s | "") return 1 ;;
+	*)
+		if [[ "$ans" =~ ^[0-9]+$ ]] && ((ans >= 1 && ans <= ${#pubs[@]})); then
+			REMOTE_KEY="${pubs[$((ans - 1))]%.pub}"
+			log_ok "Выбран ключ: $REMOTE_KEY"
+			return 0
+		fi
+		log_err "Неверный выбор"
+		return 1
+		;;
+	esac
+}
+
+remote_bootstrap_key() {
+	local pub="${REMOTE_KEY}.pub"
+	[[ -f "$pub" ]] || {
+		log_err "Нет публичной части: $pub"
+		return 1
+	}
+
+	echo ""
+	log_info "Устанавливаю ключ на сервер — пароль спросят ${C_BOLD}один раз${C_RESET} (это последний раз, когда он нужен)"
+	if ! remote_copy_id "$pub"; then
+		log_err "Авторизовать ключ не удалось (неверный пароль, запрет входа или закрыт порт)"
+		return 1
+	fi
+
+	if remote_key_auth_works; then
+		log_ok "Ключ установлен, вход по ключу работает"
+		return 0
+	fi
+	log_err "Ключ скопирован, но вход по нему не проходит — проверь настройки sshd на сервере"
+	return 1
+}
+
+# Копирует сам скрипт на сервер (и тесты не нужны: работаем одним файлом)
+remote_deliver() {
+	local self
+	self=$(readlink -f "${BASH_SOURCE[0]}")
+	local -a opts=( -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -P "$REMOTE_PORT" )
+	local -a ka=()
+	[[ -n "$REMOTE_KEY" ]] && ka=(-i "$REMOTE_KEY" -o IdentitiesOnly=yes)
+	log_info "Копирую скрипт на сервер..."
+	scp "${opts[@]}" "${ka[@]}" "$self" "$(_remote_target):/tmp/4script.sh" || {
+		log_err "Не удалось скопировать скрипт"
+		return 1
+	}
+	log_ok "Скрипт на сервере: /tmp/4script.sh"
+}
+
+# Запуск внутри screen (чтобы обрыв клиента не убил настройку).
+# Возвращает: 0 — запущено в mux, 1 — mux нет (запуск привязан к сессии).
+remote_start_server_run() {
+	local cmd='cd /tmp && chmod +x 4script.sh && '
+	local mux=""
+	if remote_run_remote 'command -v screen >/dev/null' &>/dev/null; then
+		mux=screen
+	elif remote_run_remote 'command -v tmux >/dev/null' &>/dev/null; then
+		mux=tmux
+	fi
+
+	if [[ "$mux" == screen ]]; then
+		log_info "Запускаю внутри screen (сессия $REMOTE_SESSION) — обрыв связи не прервёт настройку"
+		# -d -m: сразу в фоне; остающийся pty даёт меню нормальный терминал
+		remote_run_remote "screen -dmS $REMOTE_SESSION bash -c 'cd /tmp && exec bash ./4script.sh'" || return 1
+		return 0
+	elif [[ "$mux" == tmux ]]; then
+		log_info "Запускаю внутри tmux (сессия $REMOTE_SESSION)"
+		remote_run_remote "tmux new-session -d -s $REMOTE_SESSION 'cd /tmp && bash ./4script.sh'" || return 1
+		return 0
+	fi
+	return 1
+}
+
+remote_attach() {
+	local mux
+	mux=$(remote_run_remote 'command -v screen >/dev/null && echo screen || (command -v tmux >/dev/null && echo tmux)')
+	echo ""
+
+	# Если сессии нет, screen/tmux ругаются «Must be connected to a terminal»,
+	# и это выглядит как проблема с локальным терминалом, а не как «прогон не запущен».
+	if [[ "$mux" == screen ]] && ! remote_run_remote "screen -ls 2>/dev/null | grep -qE '\\.${REMOTE_SESSION}[[:space:]]'" &>/dev/null; then
+		log_err "Сессия $REMOTE_SESSION на сервере не найдена"
+		log_info "Запустите настройку: bash 4script.sh --remote $(_remote_target) --key ..."
+		remote_run_remote 'screen -ls 2>&1 | head -5'
+		return 1
+	fi
+	if [[ "$mux" == tmux ]] && ! remote_run_remote "tmux has-session -t $REMOTE_SESSION" &>/dev/null; then
+		log_err "Сессия $REMOTE_SESSION на сервере не найдена"
+		log_info "Запустите настройку: bash 4script.sh --remote $(_remote_target) --key ..."
+		return 1
+	fi
+
+	local -a opts=(-t -o StrictHostKeyChecking=accept-new -p "$REMOTE_PORT")
+	local -a ka=()
+	[[ -n "$REMOTE_KEY" ]] && ka=(-i "$REMOTE_KEY" -o IdentitiesOnly=yes)
+
+	case "$mux" in
+	screen)
+		# -t обязателен: меню требует терминал
+		log_info "Подключаюсь к screen-сессии $REMOTE_SESSION (отключиться — Ctrl-A d, выйти — Q в меню)"
+		# shellcheck disable=SC2029
+		ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" "screen -r $REMOTE_SESSION"
+		;;
+	tmux)
+		log_info "Подключаюсь к tmux-сессии $REMOTE_SESSION (отключиться — Ctrl-B d)"
+		# shellcheck disable=SC2029
+		ssh "${opts[@]}" "${ka[@]}" "$(_remote_target)" "tmux attach -t $REMOTE_SESSION"
+		;;
+	*)
+		log_err "На сервере нет screen и tmux — подключиться к фоновой сессии нечем"
+		return 1
+		;;
+	esac
+}
+
+remote_usage() {
+	cat <<'EOF'
+Удалённый режим: настройка сервера с этой машины.
+
+  bash 4script.sh --remote ПОЛЬЗОВАТЕЛЬ@АДРЕС[:ПОРТ] [опции]
+  bash 4script.sh --remote root@192.0.2.10 --port 8484
+
+Опции:
+  --remote СПЕЦ     сервер: user@host, user@host:port, user@host@port или host
+  --user ИМЯ        пользователь (если не указан в --remote), по умолчанию root
+  --port ПОРТ       порт SSH (по умолчанию 22)
+  --key ФАЙЛ        приватный ключ для входа (по умолчанию — подбор/ssh-agent)
+  --name ИМЯ        имя сессии screen/tmux на сервере (по умолчанию 4script)
+  --attach          только подключиться к уже идущей сессии
+  --no-attach       запустить и не подключаться (сразу вернуть управление)
+
+Пароль спрашивается один раз — для установки ключа (ssh-copy-id).
+Дальше всё работает по ключу, пароль больше не нужен.
+
+После запуска настройка идёт внутри screen на сервере: если связь оборвётся
+или ноутбук уснёт, прогон продолжится. Вернуться:
+  bash 4script.sh --remote ПОЛЬЗОВАТЕЛЬ@АДРЕС --attach
+EOF
+}
+
+remote_main() {
+	for t in ssh scp ssh-copy-id ssh-keygen; do
+		command -v "$t" &>/dev/null || {
+			log_err "Нужна утилита $t, но её нет в PATH"
+			return 1
+		}
+	done
+
+	echo ""
+	echo -e "${C_BOLD}${C_CYAN}  Удалённая настройка: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}${C_RESET}"
+
+	# 1. Есть ли уже доступ по ключу?
+	if remote_key_auth_works; then
+		log_ok "Доступ по ключу уже настроен (пароль не нужен)"
+	else
+		log_info "Доступа по ключу пока нет — установим ключ (пароль потребуется один раз)"
+		if ! remote_pick_key; then
+			log_info "Отменено"
+			return 1
+		fi
+		remote_bootstrap_key || return 1
+	fi
+
+	# 2. Кто мы на сервере: root или нам нужен sudo
+	if [[ "$(remote_run_remote 'id -u')" == "0" ]]; then
+		REMOTE_SUDO=""
+	else
+		REMOTE_SUDO="sudo"
+		if ! remote_run_remote 'command -v sudo >/dev/null' &>/dev/null; then
+			log_err "Пользователь не root и sudo на сервере нет"
+			return 1
+		fi
+		log_info "Пользователь не root — запуск будет через sudo"
+	fi
+
+	if $REMOTE_ATTACH_ONLY; then
+		remote_attach
+		return $?
+	fi
+
+	# 3. Доставляем скрипт и запускаем
+	remote_deliver || return 1
+	if remote_start_server_run; then
+		if $REMOTE_ATTACH; then
+			remote_attach
+		else
+			echo ""
+			log_ok "Настройка запущена на сервере (сессия $REMOTE_SESSION)"
+			log_info "Подключиться: bash 4script.sh --remote $(_remote_target) --attach"
+			log_info "Лог на сервере: ${C_DIM}/opt/4script/ или /opt/seq_vps/${C_RESET}"
+		fi
+		return 0
+	fi
+
+	# mux нет — запускаем прямо в этой сессии (обрыв прервёт настройку)
+	log_warn "На сервере нет screen/tmux: запускаю напрямую — обрыв связи прервёт настройку"
+	local -a opts=()
+	while IFS= read -r -d '' o; do opts+=("$o"); done < <(_remote_ssh_opts any)
+	local -a ka=()
+	[[ -n "$REMOTE_KEY" ]] && ka=(-i "$REMOTE_KEY" -o IdentitiesOnly=yes)
+	# shellcheck disable=SC2029
+	ssh -t "${opts[@]}" "${ka[@]}" "$(_remote_target)" "${REMOTE_SUDO:+$REMOTE_SUDO }bash /tmp/4script.sh"
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  ТОЧКА ВХОДА
 # ═══════════════════════════════════════════════════════════════════
 
@@ -3860,8 +4228,10 @@ show_help() {
 	echo "  Поддерживает: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux."
 	echo ""
 	echo "  Использование:"
-	echo "    sudo ./4script.sh          — интерактивное меню"
-	echo "    sudo ./4script.sh --help   — эта справка"
+	echo "    sudo ./4script.sh                     — интерактивное меню на этом сервере"
+	echo "    bash ./4script.sh --remote user@host  — настроить УДАЛЁННЫЙ сервер отсюда"
+	echo "    sudo ./4script.sh --help              — эта справка"
+	echo "    bash ./4script.sh --remote-help       — справка по удалённому режиму"
 	echo ""
 	echo "  Этапы:"
 	local def num key icon title cat fn c
@@ -3881,7 +4251,67 @@ show_help() {
 }
 
 main() {
-	[[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && show_help
+	# ── Разбор аргументов ──
+	# Удалённый режим использует только клиентские утилиты (ssh/scp/ssh-keygen),
+	# поэтому до проверки root и дистрибутива.
+	local remote_spec="" attach=false no_attach=false
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		-h | --help)
+			show_help
+			;;
+		--remote | -r)
+			remote_spec="${2:-}"
+			shift 2 || shift
+			;;
+		--remote=*)
+			remote_spec="${1#*=}"
+			shift
+			;;
+		--user)
+			REMOTE_USER="${2:-}"
+			shift 2 || shift
+			;;
+		--port | -p)
+			REMOTE_PORT="${2:-}"
+			shift 2 || shift
+			;;
+		--key)
+			REMOTE_KEY="${2:-}"
+			shift 2 || shift
+			;;
+		--name)
+			REMOTE_SESSION="${2:-}"
+			shift 2 || shift
+			;;
+		--attach)
+			attach=true
+			shift
+			;;
+		--no-attach)
+			no_attach=true
+			shift
+			;;
+		--remote-help)
+			remote_usage
+			exit 0
+			;;
+		*)
+			echo "Неизвестный аргумент: $1" >&2
+			echo "Справка: bash 4script.sh --help или --remote-help" >&2
+			exit 2
+			;;
+		esac
+	done
+
+	if [[ -n "$remote_spec" ]]; then
+		remote_parse_target "$remote_spec" || exit 2
+		REMOTE_ATTACH_ONLY=$attach
+		# по умолчанию после запуска подключаемся к сессии, кроме --no-attach
+		if $no_attach; then REMOTE_ATTACH=false; else REMOTE_ATTACH=true; fi
+		remote_main
+		exit $?
+	fi
 
 	detect_distro
 	check_root

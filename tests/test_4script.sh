@@ -120,6 +120,28 @@ printf '#auth required pam_faillock.so\n' >"$pamdir/common-auth"
 grep -qE '^[^#]*pam_faillock\.so' "$pamdir/common-auth" && fail 'faillock predicate matches commented line' || true
 rm -rf "$pamdir"
 
+# ── Удалённый режим: разбор адреса сервера ───────────────────────────
+# 6 рабочих форматов из справки должны разбираться без обращения к сети.
+while IFS='|' read -r spec want_user want_host want_port; do
+	[[ -n "$spec" ]] || continue
+	REMOTE_USER="" REMOTE_HOST="" REMOTE_PORT="22"
+	remote_parse_target "$spec" 2>/dev/null || fail "remote_parse_target rejected valid spec: $spec"
+	assert_eq "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT" "$want_user@$want_host:$want_port" "remote spec $spec"
+done <<'SPECS'
+root@10.0.20.205|root|10.0.20.205|22
+root@10.0.20.205:8484|root|10.0.20.205|8484
+root@10.0.20.205@8484|root|10.0.20.205|8484
+admin@example.com:2222|admin|example.com|2222
+10.0.20.205|root|10.0.20.205|22
+test-ubuntu.lan|root|test-ubuntu.lan|22
+SPECS
+
+# Плохие адреса должны отклоняться, а не превращаться в «root@root@»
+for spec in '' 'root@' '@host' 'host:0' 'host:99999' 'host:abc' 'user@ho st' 'us er@host'; do
+	REMOTE_USER="" REMOTE_HOST="" REMOTE_PORT="22"
+	remote_parse_target "$spec" >/dev/null 2>&1 && fail "remote_parse_target accepted bad spec: '$spec'" || true
+done
+
 # ── Ввод пароля (без изменений системы) ──────────────────────────────
 # Важно: через '< <(...)', а не 'printf | _read_new_password', иначе функция
 # работает в subshell и присваивание переменной вызывающего не видно.
