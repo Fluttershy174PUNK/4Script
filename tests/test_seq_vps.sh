@@ -76,10 +76,12 @@ tpl_keys=$(sed -n 's/=not_started$//p' "$tpl" | sort)
 [[ "$tpl_keys" == "$(printf '%s\n' "$seen_keys" | tr -s ' ' '\n' | grep . | sort)" ]] || fail 'template and registry keys diverge'
 rm -f "$tpl"
 
-# Если на машине уже есть статус-файл (реальный сервер), в нём должны быть все ключи
+# Если на машине уже есть статус-файл (реальный сервер): init_status_file
+# должен дописать в него ключи новых этапов, а не игнорировать файл.
 if [[ -f "$STAGE_STATUS_FILE" ]]; then
+	init_status_file
 	for key in $seen_keys; do
-		grep -qx "$key=.*" "$STAGE_STATUS_FILE" || fail "status file misses $key"
+		grep -q "^$key=" "$STAGE_STATUS_FILE" || fail "status file misses $key after init"
 	done
 fi
 

@@ -353,9 +353,20 @@ stage_status_template() {
 	done
 }
 
+# Статус-файл создаётся шаблоном, а при обновлении скрипта новые этапы
+# дописываются в существующий файл: иначе после апдейта в нём не окажется
+# stage16/17/18/19, и меню будет показывать неполный прогресс.
 init_status_file() {
-	[[ -f "$STAGE_STATUS_FILE" ]] && return 0
-	stage_status_template >"$STAGE_STATUS_FILE"
+	if [[ ! -f "$STAGE_STATUS_FILE" ]]; then
+		stage_status_template >"$STAGE_STATUS_FILE"
+		return 0
+	fi
+	local def num key _
+	for def in "${STAGE_DEFS[@]}"; do
+		IFS='|' read -r num key _ <<<"$def"
+		[[ -n "$key" ]] || continue
+		grep -q "^${key}=" "$STAGE_STATUS_FILE" 2>/dev/null || echo "${key}=not_started" >>"$STAGE_STATUS_FILE"
+	done
 }
 
 check_root() {
