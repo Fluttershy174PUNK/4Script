@@ -92,6 +92,7 @@ readonly STAGE_DEFS=(
 	"13|stage13_lynis|🔍|Аудит безопасности (Lynis)|system|stage_lynis"
 	"14|stage14_disk|💾|Мониторинг диска и большие файлы|system|stage_disk"
 	"15|stage15_bbr|🚀|BBR congestion control|system|stage_bbr"
+	"16|stage16_sysctl|🧩|Харденинг ядра (sysctl)|system|stage_sysctl"
 )
 readonly CATEGORY_ORDER=(setup access protect system)
 
@@ -2568,6 +2569,108 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 16: ХАРДЕНИНГ ЯДРА (SYSCTL)
+# ═══════════════════════════════════════════════════════════════════
+
+# name|рекомендуемое|что даёт
+# Значения собраны из актуальных чек-листов (CIS, kernel-hardening):
+# защита от чтения адресов ядра (обход KASLR), info-leak через dmesg,
+# дампы setuid-программ, спуфинг адресов источника, MITM через ICMP-redirect,
+# hardlink/symlink-атаки в /tmp, повышение прав через user namespaces.
+readonly SYSCTL_HARDENING=(
+	"fs.suid_dumpable|0|запрет core-дампов setuid-программ"
+	"kernel.kptr_restrict|2|скрытие адресов символов ядра от непривилегированных"
+	"kernel.dmesg_restrict|1|dmesg только для root"
+	"fs.protected_hardlinks|1|защита от hardlink-атак в world-writable каталогах"
+	"fs.protected_symlinks|1|защита от symlink-атак"
+	"fs.protected_regular|2|запрет открывать чужие файлы в sticky-каталогах на запись"
+	"kernel.yama.ptrace_scope|1|ptrace только у своих потомков"
+	"kernel.unprivileged_bpf_disabled|2|eBPF только для root"
+	"net.ipv4.conf.all.accept_redirects|0|отклонять ICMP-redirect (MITM)"
+	"net.ipv4.conf.all.send_redirects|0|не отправлять ICMP-redirect"
+	"net.ipv4.conf.all.accept_source_route|0|отклонять source-routing"
+	"net.ipv6.conf.all.accept_redirects|0|то же для IPv6"
+	"net.ipv6.conf.all.accept_source_route|0|то же для IPv6"
+	"net.ipv4.tcp_syncookies|1|защита от SYN-flood"
+	"net.ipv4.conf.all.log_martians|1|логировать пакеты с невозможными адресами"
+	"net.ipv4.conf.all.rp_filter|1|фильтрация по обратному пути (антиспуфинг)"
+	"net.ipv4.icmp_echo_ignore_broadcasts|1|игнорировать broadcast-ICMP"
+)
+
+_sysctl_conf() { printf '%s' "/etc/sysctl.d/99-seq-vps.conf"; }
+
+# Применяет только те значения, которые вообще существуют на этом ядре
+# (например, kernel.yama есть не везде, а unprivileged_userns_clone — только в Debian/Ubuntu)
+stage_sysctl() {
+	stage_banner "🧩" "16" "Харденинг ядра (sysctl)"
+
+	echo -e "${C_BOLD}▸ Рекомендуемые параметры:${C_RESET}"
+	local def name want why cur mark
+	local to_apply=()
+	for def in "${SYSCTL_HARDENING[@]}"; do
+		IFS='|' read -r name want why <<<"$def"
+		cur=$(sysctl -n "$name" 2>/dev/null) || cur=""
+		if [[ -z "$cur" ]]; then
+			printf '  %b%-40s%b %s\n' "${C_DIM}" "$name" "${C_RESET}" "нет на этом ядре — пропуск"
+			continue
+		fi
+		if [[ "$cur" == "$want" ]]; then
+			printf '  ${C_GREEN}%s${C_RESET} %-40s ${C_GREEN}%s${C_RESET} %s\n' "$ICON_OK" "$name" "$cur" "$why"
+		else
+			printf '  ${C_YELLOW}%s${C_RESET} %-40s ${C_YELLOW}%s${C_RESET} → ${C_GREEN}%s${C_RESET}\n' "$ICON_WARN" "$name" "$cur" "$want"
+			to_apply+=("$name=$want")
+		fi
+	done
+
+	echo ""
+	if [[ ${#to_apply[@]} -eq 0 ]]; then
+		log_ok "Все рекомендуемые параметры уже выставлены"
+		update_stage_status "stage16_sysctl" "completed"
+		return 0
+	fi
+
+	echo -e "  ${C_DIM}Будет изменено параметров: ${#to_apply[@]}${C_RESET}"
+	echo -e "  ${C_DIM}Файл: $(_sysctl_conf) (откат — через этап R или удаление файла)${C_RESET}"
+	confirm "Применить?" || {
+		log_info "Пропущено"
+		return 0
+	}
+
+	local conf
+	conf=$(_sysctl_conf)
+	backup_file "$conf" "stage16_sysctl"
+
+	# Пишем только снимок seq_vps, не редактируя чужие файлы в sysctl.d
+	{
+		echo "# seq_vps: харденинг ядра"
+		printf '%s\n' "${to_apply[@]}" | sed 's/=/ = /'
+	} >"$conf"
+
+	# Применяем и проверяем каждый параметр: sysctl -p не сообщает, что не применилось
+	local applied=0 failed=()
+	while read -r name want; do
+		sysctl -q -w "$name=$want" 2>/dev/null || true
+		cur=$(sysctl -n "$name" 2>/dev/null)
+		if [[ "$cur" == "$want" ]]; then
+			applied=$((applied + 1))
+		else
+			failed+=("$name (сейчас $cur, надо $want)")
+		fi
+	done < <(printf '%s\n' "${to_apply[@]}" | tr ' ' '\n' | sed 's/=/ /')
+
+	log_ok "Применено параметров: $applied из ${#to_apply[@]}"
+	if [[ ${#failed[@]} -gt 0 ]]; then
+		log_warn "Не применились (обычно locked значением в /proc от ядра или контейнера):"
+		for f in "${failed[@]}"; do echo -e "    ${C_DIM}$f${C_RESET}"; done
+		log_info "Файл записан — значения применятся при следующей загрузке, если ядро позволит"
+		update_stage_status "stage16_sysctl" "failed"
+		return 1
+	fi
+
+	update_stage_status "stage16_sysctl" "completed"
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  ЭТАП R: ОТКАТ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -2645,6 +2748,9 @@ stage_rollback() {
 			[[ "$bn" == "automatic.conf" ]] && op="/etc/dnf/automatic.conf"
 			;;
 		stage10_dns) op="/etc/resolv.conf" ;;
+		stage16_sysctl)
+			[[ "$bn" == "99-seq-vps.conf" ]] && op="/etc/sysctl.d/99-seq-vps.conf"
+			;;
 		esac
 		[[ -n "$op" ]] && {
 			cp -a "$bf" "$op"
