@@ -55,7 +55,7 @@ sudo bash seq_vps.sh
 `/opt/seq_vps/.seq_vps_status`, поэтому недоделанный прогон можно продолжить.
 
 | # | Этап | Что делает |
-|---|------|------------|
+| :- | :--- | :--------- |
 |   | **Подготовка** |   |
 | 0 | Утилиты | `micro` (редактор), `mc` (файловый менеджер) |
 | 1 | Обновление | `apt-get update/upgrade/full-upgrade`, `dnf upgrade`, предупреждает о нужной перезагрузке |
@@ -69,7 +69,7 @@ sudo bash seq_vps.sh
 | 7 | Фаервол | UFW (Debian/Ubuntu) или firewalld (RHEL-семейство) |
 | 8 | Автообновления | `unattended-upgrades` / `dnf-automatic` + окно перезагрузки |
 | 9 | От брутфорса | CrowdSec или Fail2Ban |
-| 10 | DNS | замена резолверов (с учётом systemd-resolved) |
+| 10 | DNS | замена резолверов (с учётом systemd-resolved); список заменяется целиком, режима «добавить» нет |
 |   | **Система и сеть** |   |
 | 11 | Fish shell | установка fish |
 | 12 | Время | часовой пояс + NTP |
@@ -139,6 +139,15 @@ sudo bash seq_vps.sh
 `semanage port -a -t ssh_port_t -p tcp <порт>` — без этого sshd не поднимется
 на нестандартном порту. Файлы SFTP-chroot получают `restorecon`, иначе sshd
 не может их прочитать (метка `user_home_t` вместо типа chroot).
+
+**Пароль SFTP не блокируется глобальным конфигом.** Блок
+`Match User <имя>` заново включает `PasswordAuthentication` для одного
+пользователя, а `Match` переопределяет глобальную секцию — проверено через
+`sshd -T -C user=<имя>` на сгенерированных файлах. Глобальный drop-in при
+этом продолжает действовать для всех остальных, включая `root`. Учти, что в
+`Match` можно задать лишь часть директив; `PasswordAuthentication`,
+`KbdInteractiveAuthentication`, `ChrootDirectory`, `ForceCommand` и
+`AuthorizedKeysFile` в эту часть входят.
 
 **Фаервол под дистрибутив.** Debian/Ubuntu → `ufw`, RHEL-семейство →
 `firewalld`. Они конфликтуют за netfilter, поэтому настраивается только

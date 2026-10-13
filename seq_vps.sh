@@ -1943,10 +1943,11 @@ EOF
 _dns_backend() {
 	if command -v resolvectl &>/dev/null && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
 		echo resolved
+	elif command -v netplan &>/dev/null; then
+		# только бинарь: каталог /etc/netplan есть и там, где netplan не используется
+		echo netplan
 	elif [[ -L /etc/resolv.conf ]]; then
 		echo symlink
-	elif command -v netplan &>/dev/null || [[ -d /etc/netplan ]]; then
-		echo netplan
 	else
 		echo file
 	fi

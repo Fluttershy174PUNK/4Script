@@ -55,7 +55,7 @@ Stages are grouped by what they affect. Status marks in the menu come from
 `/opt/seq_vps/.seq_vps_status`, so a partially finished run is resumable.
 
 | # | Stage | What it does |
-|---|-------|--------------|
+| :- | :--- | :----------- |
 |   | **Setup** |   |
 | 0 | Utilities | `micro` (editor), `mc` (file manager) |
 | 1 | System update | `apt-get update/upgrade/full-upgrade`, `dnf upgrade`, warns when a reboot is required |
@@ -69,7 +69,7 @@ Stages are grouped by what they affect. Status marks in the menu come from
 | 7 | Firewall | UFW (Debian/Ubuntu) or firewalld (RHEL family) |
 | 8 | Auto-updates | `unattended-upgrades` / `dnf-automatic` + reboot window |
 | 9 | Brute force | CrowdSec or Fail2Ban |
-| 10 | DNS | replace resolvers (systemd-resolved aware) |
+| 10 | DNS | replace resolvers (systemd-resolved aware); replaces the previous list, no "append" mode |
 |   | **System and network** |   |
 | 11 | Fish shell | install fish |
 | 12 | Time | timezone + NTP |
@@ -143,6 +143,15 @@ typo.
 start on a non-standard port. Files created for the SFTP chroot get
 `restorecon`, otherwise sshd cannot read them (`user_home_t` instead of the
 chroot type).
+
+**SFTP password login is not blocked by the hardened global config.** The
+`Match User <name>` block re-enables `PasswordAuthentication` for that one
+user, and a `Match` block overrides the global section — verified with
+`sshd -T -C user=<name>` against the generated files. The global drop-in still
+wins for everyone else, including `root`. Note that a `Match` block can only
+set a subset of directives; `PasswordAuthentication`,
+`KbdInteractiveAuthentication`, `ChrootDirectory`, `ForceCommand` and
+`AuthorizedKeysFile` are all in that subset.
 
 **Firewall per distribution.** Debian/Ubuntu → `ufw`, RHEL family →
 `firewalld`. They fight over netfilter, so only the native one is configured.
