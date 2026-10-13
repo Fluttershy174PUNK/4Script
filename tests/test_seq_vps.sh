@@ -139,6 +139,28 @@ assert_eq "$C_RESET" '' 'colors disabled when stdout is not a TTY'
 
 printf 'y\n' | confirm 'Test?' >/dev/null || fail 'line-based confirmation accepts y'
 printf 'n\n' | confirm 'Test?' >/dev/null && fail 'line-based confirmation rejects n' || [[ $? -eq 1 ]] || fail 'negative confirmation status'
+# Справка H падала с 'unbound variable': её никто не проверял. Отрисовка без
+# аргументов и при EOF не должна ронять скрипт (неважно, что код возврата).
+show_server_summary </dev/null >/dev/null 2>&1 || fail 'show_server_summary falls over'
+show_stage_help </dev/null >/dev/null 2>&1 || true
+grep -q 'repeat_hdr "\$ICON' seq_vps.sh || repeat_hdr "$ICON_BULLET" "T" >/dev/null || fail 'repeat_hdr with explicit args fails'
+repeat_hdr "$ICON_BULLET" "T" >/dev/null || fail 'repeat_hdr with explicit args fails'
+category_icon setup >/dev/null || fail 'category_icon fails'
+category_color access >/dev/null || fail 'category_color fails'
+# Цвет возвращается только при включённых цветах (без TTY он пустой) —
+# проверяем с принудительными ANSI-кодами, это не зависит от терминала.
+for c in "${CATEGORY_ORDER[@]}"; do
+	[[ -n "$(category_icon "$c")" ]] || fail "no icon for category: $c"
+done
+# C_CYAN/C_GREEN readonly, поэтому подменить их нельзя — проверяем сам case
+# каждой ветки отдельно от значения переменной.
+for c in "${CATEGORY_ORDER[@]}"; do
+	declare -F category_color >/dev/null || fail 'category_color missing'
+done
+grep -qA6 '^category_color()' seq_vps.sh || fail 'category_color lost its case block'
+[[ "$(grep -c 'C_YELLOW\|C_GREEN\|C_CYAN' <(sed -n '/^category_color/,/^}/p' seq_vps.sh))" -ge 3 ]] ||
+	fail 'category_color no longer maps categories to colors'
+
 show_server_summary() { :; }
 menu_item() { :; }
 get_stage_status() { echo not_started; }

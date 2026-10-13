@@ -3373,7 +3373,7 @@ stage_rollback() {
 show_stage_help() {
 	local def num key icon title cat fn done_total=0 done_done=0
 	echo ""
-	repeat_hdr "Этапы и порядок"
+	repeat_hdr "$ICON_BULLET" "Этапы и порядок"
 	local c
 	for c in "${CATEGORY_ORDER[@]}"; do
 		printf "  ${C_BOLD}${C_CYAN}▸ %s${C_RESET}\n" "$(category_title "$c")"
@@ -3390,7 +3390,7 @@ show_stage_help() {
 	done
 	echo "  ${C_DIM}Порядок для нового сервера: 0, 1, 2, 4 → проверь вход по ключу…"
 	echo "  ${C_DIM}→ 7 (фаервол) → 5 (порт и пароли) → 8, 9 → 3 (пароль root) → остальное.${C_RESET}"
-	printf '  ${C_DIM}Выполнено: %d из %d этапов${C_RESET}\n' "$done_done" "$done_total"
+	printf "  ${C_DIM}Выполнено: %d из %d этапов${C_RESET}\n" "$done_done" "$done_total"
 	echo ""
 	read -rp "  Enter — в меню... " _
 }
