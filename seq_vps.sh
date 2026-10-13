@@ -595,7 +595,7 @@ pkg_install_retry() {
 		log_info "Установка ${C_BOLD}$pkg${C_RESET} (попытка $((retry + 1))/$max)..."
 		spinner_start "Устанавливаем $pkg..."
 		case "$PKG_MGR" in
-		apt) apt install -y -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$pkg" &>/dev/null && {
+		apt) apt-get install -y -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$pkg" &>/dev/null && {
 			spinner_stop
 			return 0
 		} ;;
@@ -682,7 +682,7 @@ stage_update() {
 	local max=3 retry=0
 	while [[ $retry -lt $max ]]; do
 		case "$PKG_MGR" in
-		apt) apt update &>/dev/null && break ;;
+		apt) apt-get update &>/dev/null && break ;;
 		dnf | yum) $PKG_MGR update -y &>/dev/null && break ;;
 		esac
 		retry=$((retry + 1))
@@ -697,9 +697,9 @@ stage_update() {
 	spinner_start "Устанавливаем обновления..."
 	case "$PKG_MGR" in
 	apt)
-		apt upgrade -y &>/dev/null || true
-		apt full-upgrade -y &>/dev/null || true
-		apt autoremove --purge -y &>/dev/null || true
+		apt-get upgrade -y &>/dev/null || true
+		apt-get full-upgrade -y &>/dev/null || true
+		apt-get autoremove --purge -y &>/dev/null || true
 		;;
 	dnf | yum)
 		$PKG_MGR upgrade -y &>/dev/null || true
@@ -709,6 +709,10 @@ stage_update() {
 	spinner_stop
 
 	log_ok "Система обновлена"
+	# без перезагрузки работает старое ядро/библиотеки — скажем об этом явно
+	if [[ -f /var/run/reboot-required || -f /run/reboot-required ]]; then
+		log_warn "Требуется перезагрузка (обновлено ядро или системные пакеты): reboot"
+	fi
 	update_stage_status "stage1_update" "completed"
 }
 
@@ -1088,6 +1092,68 @@ _selinux_ssh_port() {
 		log_warn "semanage port $port не сработал — проверьте: semanage port -l | grep ssh"
 }
 
+# Ubuntu 22.10+ и Debian 13 используют systemd-сокет активацию: слушает
+# ssh.socket, а Port из sshd_config игнорируется. Без правки сокета смена
+# порта «проходит», но старый порт продолжает слушать — а новый нет.
+_ssh_socket_active() {
+	systemctl is-active --quiet ssh.socket 2>/dev/null && return 0
+	systemctl is-enabled --quiet ssh.socket 2>/dev/null && return 0
+	return 1
+}
+
+# Порт сокета. ListenStream= без значения сбрасывает базовый 22 из ssh.socket,
+# иначе override добавит второй слушатель и старый порт останется открыт.
+_ssh_socket_port() {
+	local port="$1"
+	local dir="/etc/systemd/system/ssh.socket.d"
+	local f="$dir/10-seq-vps.conf"
+	mkdir -p "$dir"
+	backup_file "$f" "stage5_ssh_config"
+	cat >"$f" <<EOF
+# seq_vps: порт сокет-активации (ListenStream= сбрасывает дефолтный 22)
+[Socket]
+ListenStream=
+ListenStream=$port
+EOF
+	systemctl daemon-reload 2>/dev/null || true
+}
+
+_ssh_validate() {
+	sshd -t 2>&1 | tee -a "$LOG_FILE"
+}
+
+# Перезапуск SSH (с сокетом, если он есть) + проверка, что порт реально слушается
+_ssh_restart() {
+	systemctl restart "$SSH_SERVICE" 2>/dev/null || {
+		log_err "Не удалось перезапустить $SSH_SERVICE"
+		return 1
+	}
+	# при сокет-активации ssh.service сам не слушает — нужен рестарт сокета
+	if _ssh_socket_active; then
+		systemctl restart ssh.socket 2>/dev/null || log_warn "ssh.socket не перезапустился"
+	fi
+	log_ok "SSH перезапущен ($SSH_SERVICE)"
+	sleep 2
+	local listen=""
+	if command -v ss &>/dev/null; then
+		listen=$(ss -tln 2>/dev/null | grep -c ":${CURRENT_SSH_PORT} ")
+	elif command -v netstat &>/dev/null; then
+		listen=$(netstat -tln 2>/dev/null | grep -c ":${CURRENT_SSH_PORT} ")
+	fi
+	if [[ "$listen" == "0" ]]; then
+		if _ssh_socket_active; then
+			log_warn "Порт $CURRENT_SSH_PORT не слушается — проверьте: systemctl cat ssh.socket"
+		else
+			log_warn "Не удалось проверить порт $CURRENT_SSH_PORT"
+		fi
+		if _ssh_socket_active && ! systemctl cat ssh.socket 2>/dev/null | grep -q "$CURRENT_SSH_PORT"; then
+			log_warn "ssh.socket не знает о порте $CURRENT_SSH_PORT — включите его через пункт 1"
+		fi
+	else
+		log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
+	fi
+}
+
 # Фаервол: на RHEL-семействе нативный firewalld, не ufw (конфликтуют на netfilter)
 _fw_cmd() {
 	[[ "$PKG_MGR" == dnf || "$PKG_MGR" == yum ]] && echo firewalld || echo ufw
@@ -1165,6 +1231,10 @@ stage_ssh_config() {
 		}
 		_ssh_set "Port" "$np"
 		_selinux_ssh_port "$np"
+		if _ssh_socket_active; then
+			_ssh_socket_port "$np"
+			log_info "Сокет-активация (ssh.socket) — порт прописан и в сокете"
+		fi
 		CURRENT_SSH_PORT=$np
 		log_ok "Порт → $np"
 		;;
@@ -1173,11 +1243,14 @@ stage_ssh_config() {
 		read -rp "  ${ICON_ARROW} " c
 		[[ "$c" == "2" ]] && {
 			_ssh_set "PasswordAuthentication" "no"
-			log_ok "Парольный вход отключён"
+			# без этого пароль всё равно принимается через PAM (keyboard-interactive)
+			_ssh_set "KbdInteractiveAuthentication" "no"
+			log_ok "Парольный вход отключён (password + keyboard-interactive)"
 			echo -e "  ${C_YELLOW}${ICON_WARN}  Убедитесь, что SSH-ключ установлен!${C_RESET}"
 		}
 		[[ "$c" == "1" ]] && {
 			_ssh_set "PasswordAuthentication" "yes"
+			_ssh_set "KbdInteractiveAuthentication" "yes"
 			log_ok "Парольный вход включён"
 		}
 		;;
@@ -1221,23 +1294,14 @@ stage_ssh_config() {
 
 	echo ""
 	log_info "Валидация конфигурации..."
-	if ! sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+	if ! _ssh_validate; then
 		log_err "Ошибка в конфиге SSH! Перезапуск отменён."
 		return 1
 	fi
 
 	echo ""
 	if confirm "Перезапустить SSH?"; then
-		systemctl restart "$SSH_SERVICE"
-		log_ok "SSH перезапущен ($SSH_SERVICE)"
-		sleep 2
-		if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ":${CURRENT_SSH_PORT} " 2>/dev/null; then
-			log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
-		elif command -v netstat &>/dev/null && netstat -tlnp 2>/dev/null | grep -q ":${CURRENT_SSH_PORT} " 2>/dev/null; then
-			log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
-		else
-			log_warn "Не удалось проверить порт $CURRENT_SSH_PORT"
-		fi
+		_ssh_restart
 	fi
 
 	echo ""
@@ -1299,15 +1363,18 @@ Match User $sfu
 EOF
 	chmod 644 "$sftp_cfg"
 
-	if ! sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+	if ! _ssh_validate; then
 		log_err "Ошибка в конфиге SSH!"
 		rm -f "$sftp_cfg"
 		userdel "$sfu" 2>/dev/null || true
 		rm -rf "$chroot_dir"
 		return 1
 	fi
-	if ! systemctl restart "$SSH_SERVICE"; then
-		log_err "Не удалось перезапустить SSH"
+	# SELinux enforcing: файлы в /srv получают user_home_t, sshd не читает chroot
+	if $HAS_SELINUX && command -v restorecon &>/dev/null; then
+		restorecon -R "$chroot_dir" 2>/dev/null || true
+	fi
+	if ! _ssh_restart; then
 		rm -f "$sftp_cfg"
 		userdel "$sfu" 2>/dev/null || true
 		rm -rf "$chroot_dir"
@@ -1326,8 +1393,7 @@ EOF
 			echo "$pk" >"/etc/ssh/keys.d/$sfu.pub"
 			chmod 600 "/etc/ssh/keys.d/$sfu.pub"
 			echo "    AuthorizedKeysFile /etc/ssh/keys.d/%u.pub" >>"$sftp_cfg"
-			systemctl restart "$SSH_SERVICE"
-			log_ok "Ключ установлен"
+			_ssh_validate && _ssh_restart && log_ok "Ключ установлен"
 		}
 		;;
 	2)
@@ -1349,8 +1415,7 @@ EOF
 				cp "$sh/.ssh/authorized_keys" "/etc/ssh/keys.d/$sfu.pub"
 				chmod 600 "/etc/ssh/keys.d/$sfu.pub"
 				echo "    AuthorizedKeysFile /etc/ssh/keys.d/%u.pub" >>"$sftp_cfg"
-				systemctl restart "$SSH_SERVICE"
-				log_ok "Ключ от $su скопирован"
+				_ssh_validate && _ssh_restart && log_ok "Ключ от $su скопирован"
 			fi
 		}
 		;;
@@ -1574,7 +1639,7 @@ stage_autoupdate() {
 	apt)
 		backup_file "/etc/apt/apt.conf.d/20auto-upgrades" "stage8_autoupdate"
 		backup_file "/etc/apt/apt.conf.d/50unattended-upgrades" "stage8_autoupdate"
-		apt update &>/dev/null
+		apt-get update &>/dev/null
 		pkg_install_retry "unattended-upgrades"
 		cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
@@ -1737,7 +1802,7 @@ _install_crowdsec() {
 	}
 
 	case "$PKG_MGR" in
-	apt) apt update &>/dev/null ;;
+	apt) apt-get update &>/dev/null ;;
 	dnf | yum) $PKG_MGR makecache &>/dev/null ;;
 	esac
 
@@ -1754,6 +1819,7 @@ _install_crowdsec() {
 		systemctl enable --now crowdsec 2>/dev/null || true
 		sleep 2
 		systemctl is-active --quiet crowdsec && log_ok "CrowdSec запущен (без бонсера)" || log_warn "CrowdSec не запустился"
+		_crowdsec_collections
 		_install_fail2ban
 		cscli version 2>/dev/null || true
 		return 0
@@ -1767,7 +1833,24 @@ _install_crowdsec() {
 	systemctl start crowdsec-firewall-bouncer 2>/dev/null || true
 	sleep 2
 	systemctl is-active --quiet crowdsec && log_ok "CrowdSec запущен" || log_warn "CrowdSec не запустился"
+	_crowdsec_collections
 	cscli version 2>/dev/null || true
+}
+
+# Без коллекции sshd движок работает, но SSH-атаки не видит.
+_crowdsec_collections() {
+	command -v cscli &>/dev/null || return 0
+	if cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd"; then
+		log_ok "CrowdSec: коллекция crowdsecurity/sshd установлена"
+		return 0
+	fi
+	log_info "CrowdSec: ставлю коллекцию crowdsecurity/sshd..."
+	if cscli collections install crowdsecurity/sshd &>>"$LOG_FILE"; then
+		systemctl reload crowdsec 2>/dev/null || systemctl restart crowdsec 2>/dev/null || true
+		log_ok "CrowdSec: коллекция crowdsecurity/sshd установлена"
+	else
+		log_warn "Не удалось поставить crowdsecurity/sshd (нет сети?) — вручную: cscli collections install crowdsecurity/sshd"
+	fi
 }
 
 _install_fail2ban() {
@@ -1787,6 +1870,17 @@ _install_fail2ban() {
 	local banaction=""
 	[[ "$(_fw_cmd)" == firewalld ]] && banaction="banaction = firewallcmd-ipset"
 
+	# backend systemd требует python3-systemd; без него jail не стартует,
+	# поэтому ставим пакет, а если его нет в репо — уходим на polling по логу
+	local backend="backend = %(sshd_backend)s"
+	if ! dpkg -s python3-systemd &>/dev/null 2>&1; then
+		pkg_install_retry "python3-systemd" || true
+	fi
+	if ! dpkg -s python3-systemd &>/dev/null 2>&1 && ! rpm -q python3-systemd &>/dev/null 2>&1; then
+		backend="backend = polling"
+		log_info "python3-systemd недоступен — Fail2Ban будет читать лог напрямую"
+	fi
+
 	cat >"$f2b_jail" <<EOF
 [DEFAULT]
 bantime = 1h
@@ -1799,7 +1893,7 @@ ${banaction}
 enabled = true
 port = $sp
 logpath = %(sshd_log)s
-backend = %(sshd_backend)s
+${backend}
 maxretry = 3
 bantime = 24h
 EOF
@@ -1814,34 +1908,90 @@ EOF
 #  ЭТАП 10: DNS
 # ═══════════════════════════════════════════════════════════════════
 
+# Кто владеет DNS: systemd-resolved или сам файл /etc/resolv.conf.
+# Прямая запись в файл на resolved-системах бесполезна: он симлинк на stub,
+# а перегенерация затрёт ручные nameserver при следующем boot.
+_dns_backend() {
+	if command -v resolvectl &>/dev/null && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+		echo resolved
+	elif [[ -L /etc/resolv.conf ]]; then
+		echo symlink
+	elif command -v netplan &>/dev/null || [[ -d /etc/netplan ]]; then
+		echo netplan
+	else
+		echo file
+	fi
+}
+
+_dns_current() {
+	local b
+	b=$(_dns_backend)
+	if [[ "$b" == resolved ]]; then
+		resolvectl dns 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u
+	else
+		grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}'
+	fi
+}
+
+_dns_apply() {
+	local servers="$1" b
+	b=$(_dns_backend)
+	case "$b" in
+	resolved)
+		local dir="/etc/systemd/resolved.conf.d"
+		mkdir -p "$dir"
+		backup_file "$dir/10-seq-vps.conf" "stage10_dns"
+		{
+			echo "# seq_vps"
+			echo "[Resolve]"
+			echo "DNS=$servers"
+		} >"$dir/10-seq-vps.conf"
+		systemctl restart systemd-resolved 2>/dev/null || log_warn "systemd-resolved не перезапустился"
+		log_ok "DNS через systemd-resolved: $servers"
+		;;
+	netplan)
+		log_warn "DNS управляется netplan — правка /etc/resolv.conf будет затёрта при boot"
+		log_info "Задайте nameservers в /etc/netplan/*.yaml и выполните: netplan apply"
+		;;
+	*)
+		backup_file "/etc/resolv.conf" "stage10_dns"
+		{
+			echo "# seq_vps"
+			local s
+			for s in $servers; do echo "nameserver $s"; done
+		} >/etc/resolv.conf
+		log_ok "DNS записаны в /etc/resolv.conf"
+		;;
+	esac
+}
+
 stage_dns() {
 	stage_banner "$ICON_GLOBE" "10" "Настройка DNS"
-	backup_file "/etc/resolv.conf" "stage10_dns"
 
+	local b
+	b=$(_dns_backend)
 	echo -e "${C_BOLD}Текущие DNS:${C_RESET}"
-	grep "^nameserver" /etc/resolv.conf 2>/dev/null || echo "  ${C_DIM}(нет)${C_RESET}"
+	local cur
+	cur=$(_dns_current)
+	[[ -n "$cur" ]] && echo "$cur" | sed 's/^/  /' || echo -e "  ${C_DIM}(нет)${C_RESET}"
+	echo -e "  ${C_DIM}Управление: $b${C_RESET}"
 
 	echo ""
-	echo "  1) Заменить    2) Добавить    3) Пропустить"
+	echo "  1) Заменить    3) Пропустить"
 	read -rp "  ${ICON_ARROW} " da
 	case "$da" in
 	1)
 		read -rp "  Серверы (через пробел): " srv
-		{
-			echo "# seq_vps"
-			for s in $srv; do echo "nameserver $s"; done
-		} >/etc/resolv.conf
-		log_ok "DNS заменены"
-		;;
-	2)
-		read -rp "  Серверы (через пробел): " srv
-		for s in $srv; do echo "nameserver $s" >>/etc/resolv.conf; done
-		log_ok "DNS добавлены"
+		[[ -n "$srv" ]] || {
+			log_err "Пустой список"
+			return 1
+		}
+		_dns_apply "$srv"
 		;;
 	*) log_info "Пропущено" ;;
 	esac
 	echo ""
-	grep "^nameserver" /etc/resolv.conf 2>/dev/null
+	_dns_current | sed 's/^/  /'
 	update_stage_status "stage10_dns" "completed"
 }
 
