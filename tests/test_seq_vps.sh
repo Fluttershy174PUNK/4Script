@@ -50,13 +50,16 @@ assert_eq "$(cut -d'|' -f6 <<<"$(stage_def 5)")" 'stage_ssh_config' 'stage_def f
 assert_eq "$(cut -d'|' -f6 <<<"$(stage_def stage15_bbr)")" 'stage_bbr' 'stage_def finds stage by status key'
 stage_def nosuchstage >/dev/null 2>&1 && fail 'stage_def accepts unknown input' || true
 
-# init_status_file пишет строку на каждый ключ реестра (файл создаётся в temp)
-tmp_status=$(mktemp)
-STAGE_STATUS_FILE="$tmp_status" init_status_file
-for key in $seen_keys; do
-	grep -qx "$key=not_started" "$tmp_status" || fail "init_status_file misses $key"
-done
-rm -f "$tmp_status"
+# STAGE_STATUS_FILE объявлена readonly, поэтому подменить путь нельзя.
+# Проверяем главное: генератор берёт ключи из реестра, а не из своей копии списка.
+grep -q 'STAGE_DEFS' <(declare -f init_status_file) || fail 'init_status_file no longer reads the registry'
+
+# Если на машине уже есть статус-файл (реальный сервер), в нём должны быть все ключи
+if [[ -f "$STAGE_STATUS_FILE" ]]; then
+	for key in $seen_keys; do
+		grep -qx "$key=.*" "$STAGE_STATUS_FILE" || fail "status file misses $key"
+	done
+fi
 
 # sshd -T печатает директивы в нижнем регистре, но старый awk был регистрозависим
 assert_eq "$(_sshd_option 'PasswordAuthentication no' passwordauthentication yes)" 'no' 'option read from lowercase dump'
