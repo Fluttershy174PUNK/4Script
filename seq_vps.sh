@@ -413,6 +413,15 @@ _read_new_password() {
 	printf -v "$var" '%s' "$pw"
 }
 
+# Минимальная версия OpenSSH, с которой доступна директива (её нет в старых
+# sshd и _sshd_config_ok отклонит кандидата).
+_sshd_version_at_least() {
+local need="$1" ver
+ver=$(sshd -V 2>&1 | head -1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | cut -d_ -f2)
+[[ -n "$ver" ]] || return 1
+printf '%s\n%s\n' "$need" "$ver" | sort -V -C
+}
+
 get_regular_users() {
 	while IFS=: read -r user _ uid _ _ home shell; do
 		[[ $uid -ge 1000 ]] || continue
@@ -1300,6 +1309,13 @@ stage_ssh_config() {
 	echo -e "  4) Макс. попыток:   ${ma}"
 	echo -e "  5) Пустые пароли:   ${sc_empty}${ep}${C_RESET}"
 	echo "  6) Показать все настройки"
+	local psp
+	psp=$(_sshd_option "$sc" persourcepenalties enabled)
+	if [[ "$psp" == disabled ]]; then
+		echo "  7) Rate-limit атакующих (PerSourcePenalties): ${C_DIM}нет (OpenSSH < 9.8)${C_RESET}"
+	else
+		echo "  7) Rate-limit атакующих (PerSourcePenalties): ${C_GREEN}встроенный${C_RESET}"
+	fi
 	echo "  S) Пропустить"
 	echo ""
 	read -rp "  ${ICON_ARROW} " sa
@@ -1375,6 +1391,25 @@ stage_ssh_config() {
 		echo "Drop-in ($cfg):"
 		cat "$cfg"
 		echo ""
+		;;
+	7)
+		# OpenSSH 9.8+ сам штрафует источники (authfail, noauth, crash) — это
+		# встроенная защита от брутфорса до Fail2Ban. По умолчанию включена;
+		# имеет смысл явно закрепить и посмотреть, как выглядит политика.
+		if ! _sshd_version_at_least 9.8; then
+			log_warn "OpenSSH < 9.8: PerSourcePenalties недоступны"
+			log_info "Защита от брутфорса — этап 9 (Fail2Ban/CrowdSec)"
+		else
+			echo ""
+			echo -e "  ${C_DIM}Условия: authfail, noauth, invaliduser, crash; далее минуты бана и потолок${C_RESET}"
+			echo "  Текущая политика: $(_sshd_option "$sc" persourcepenalties '(по умолчанию)')"
+			echo -e "  ${C_DIM}Это встроенный rate-limit: источник с ошибками входа временно
+  перестаёт получать соединения. Дополняет Fail2Ban (этап 9), не заменяет.${C_RESET}"
+			echo ""
+			if confirm "Включить PerSourcePenalties явно?"; then
+				_ssh_apply "PerSourcePenalties включены" "PerSourcePenalties=yes" || return 1
+			fi
+		fi
 		;;
 	*) log_info "Пропущено" ;;
 	esac
