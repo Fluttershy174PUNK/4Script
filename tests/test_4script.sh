@@ -189,4 +189,137 @@ get_stage_status() { echo not_started; }
 log_info() { :; }
 if (main_menu </dev/null >/dev/null); then :; else fail 'EOF-safe menu exits cleanly'; fi
 
+# ── Alpine: выбор пакетного менеджера ────────────────────────────────
+# Сама detect_distro завершает скрипт на неизвестном ID, поэтому тестируем
+# чистую _pkg_mgr_for_id и проверяем, что detect_distro её действительно зовёт.
+assert_eq "$(_pkg_mgr_for_id debian)" 'apt' 'debian -> apt'
+assert_eq "$(_pkg_mgr_for_id ubuntu)" 'apt' 'ubuntu -> apt'
+assert_eq "$(_pkg_mgr_for_id alpine)" 'apk' 'alpine -> apk'
+assert_eq "$(_pkg_mgr_for_id postmarketos)" 'apk' 'postmarketos -> apk'
+_pkg_mgr_for_id gentoo >/dev/null && fail 'unknown distro must not resolve a package manager' || true
+grep -q '_pkg_mgr_for_id "${ID:-}"' 4script.sh || fail 'detect_distro no longer uses _pkg_mgr_for_id'
+grep -q 'alpine | postmarketos)' 4script.sh || fail 'alpine missing from package-manager mapping'
+
+# Alpine не должен нигде требовать systemd напрямую: все сервисные операции
+# обязаны идти через svc_*, иначе init-agnostic-обещание — ложь.
+for fn in svc_is_active svc_is_enabled svc_start svc_stop svc_restart svc_enable svc_disable svc_enable_now svc_disable_now svc_daemon_reload svc_exists; do
+	declare -F "$fn" >/dev/null || fail "missing service helper: $fn"
+done
+grep -q 'rc-update add "\$1" default' 4script.sh || fail 'svc_enable does not use rc-update on OpenRC'
+grep -q 'rc-service "\$1" status' 4script.sh || fail 'svc_is_active does not use rc-service on OpenRC'
+# systemctl допустим только внутри самого слоя (функции svc_*) и под проверкой
+# $HAS_SYSTEMD. Ищем вызовы вне body svc_*-функций, а не по подстроке — иначе
+# тест ловит собственные строки слоя и комментарии.
+bare=$(awk '
+	/^svc_[a-z_]*\(\)/ { inlayer=1 }
+	inlayer && /^\}/ { inlayer=0; next }
+	systemctl { if (!inlayer) print NR": "$0 }
+' 4script.sh | grep -vE 'HAS_SYSTEMD|ssh\.socket|systemd-resolved|list-unit-files' || true)
+[[ -z "$bare" ]] || fail "systemctl used outside the service layer: $bare"
+
+# Alpine-пакеты: имена, которых нет в apk (проверены вручную), не должны
+# оставаться в коде как безусловные установки.
+grep -q 'libpwquality' 4script.sh || fail 'Alpine pwquality package name missing'
+grep -q 'libpam-pwquality' 4script.sh || fail 'Debian pwquality package name lost'
+grep -q 'ufw-openrc' 4script.sh || fail 'ufw-openrc is required for UFW autostart on Alpine'
+grep -q '/etc/periodic/daily/4script-security-update' 4script.sh || fail 'Alpine autoupdate script missing'
+
+# PAM-стеки: Alpine base-*, Debian/Ubuntu common-*. Пути не должны быть
+# захардкожены в теле функций (иначе Alpine правит несуществующие файлы).
+grep -q 'PAM_AUTH_FILE="/etc/pam.d/base-auth"' 4script.sh || fail 'Alpine PAM auth stack missing'
+grep -q 'PAM_AUTH_FILE="/etc/pam.d/common-auth"' 4script.sh || fail 'Debian PAM auth stack missing'
+
+# Откат: этап 18 бэкапит несколько файлов и имена стеков различаются между
+# Alpine и Debian — общая ветка должна покрывать оба набора имён.
+grep -q 'stage18_pam | stage19_auditd | stage9_intrusion)' 4script.sh || fail 'rollback lost the multi-file PAM/f2b/audit branch'
+grep -q 'base-account' 4script.sh || fail 'rollback does not restore Alpine PAM stacks'
+_pam_restore_body=$(sed -n '/^_pam_restore()/,/^}/p' 4script.sh)
+grep -q 'base-password' <<<"$_pam_restore_body" || fail '_pam_restore cannot restore Alpine base-password'
+grep -q 'common-password' <<<"$_pam_restore_body" || fail '_pam_restore cannot restore Debian common-password'
+
+# apk возвращает 1 и когда пакет реально установлен (артефакты chown в
+# контейнере) — поэтому успех обязан проверяться через apk info -e.
+grep -q 'apk info -e' 4script.sh || fail 'apk install success must be verified with apk info -e'
+
+# Alpine без syslog-демона: init-скрипт даёт только busybox-openrc
+grep -q 'busybox-openrc' 4script.sh || fail 'Alpine syslog needs busybox-openrc (init script)'
+
+# _server_ip — замена hostname -I, которого нет в busybox
+grep -q 'hostname -I' 4script.sh || fail '_server_ip lost its fast path'
+declare -F _server_ip >/dev/null || fail 'missing _server_ip helper'
+
+# ── Цвета не должны печататься текстом ────────────────────────────────
+# C_* объявлены в ОДИНАРНЫХ кавычках, то есть содержат литерал «\033[1m», а не
+# настоящий escape. Такой литерал превращают в цвет только echo -e и printf %b;
+# обычный echo печатает «\033[1m» прямо на экране. Оба случая уже случались.
+bad=$(grep -nE '^[[:space:]]*echo "[^"]*\$\{C_' 4script.sh || true)
+[[ -z "$bad" ]] || fail "echo without -e prints colour escapes literally: $bad"
+# \${C_ должен встречаться ВНУТРИ одинарного формата (до закрывающей кавычки):
+# в корректной строке цвета идут аргументами и через %b, вне формата.
+bad=$(grep -nE "^[[:space:]]*printf '[^']*\\\$\\{C_" 4script.sh || true)
+[[ -z "$bad" ]] || fail "single-quoted printf format keeps \${C_...} as text: $bad"
+# обратная проверка: объявления остались в одинарных кавычках, иначе тесты выше
+# перестали бы ловить именно этот класс ошибок
+grep -qF "C_BOLD='\033[1m'" 4script.sh || fail 'colour declarations changed shape — re-check escape tests'
+
+# ── Этап 21: локальный вход ───────────────────────────────────────────
+# Отключение консоли ломается тише всего: /etc/inittab легко склеить в одну
+# строку или оставить сервер без единого входа.
+for fn in _virt_type _console_getty_state _console_root_state _console_disable _console_enable _console_report stage_console; do
+	declare -F "$fn" >/dev/null || fail "missing console helper: $fn"
+done
+grep -q 'stage21_console' 4script.sh || fail 'stage 21 (console) missing from the registry'
+grep -q 'stage21_console)$' 4script.sh || fail 'stage 21 missing from the rollback mapping'
+grep -q '^_CONSOLE_MARK=' 4script.sh || fail 'console marker must be its own constant (OWN_MARK has a #)'
+grep -qF 'sed -i "s|^${_CONSOLE_MARK}||"' 4script.sh ||
+	fail 'inittab restore must strip the marker with | as delimiter'
+# литерал «\n» в printf склеивает файл в одну строку — уже случалось
+bad=$(grep -nE "printf '[^']*\\\\\\\\n" 4script.sh || true)
+[[ -z "$bad" ]] || fail "printf with a doubled backslash prints literal \\n: $bad"
+
+# ── Перезапуск SSH после правки ключей ───────────────────────────────
+declare -F _ssh_after_keys_change >/dev/null || fail 'missing _ssh_after_keys_change'
+grep -q '_ssh_after_keys_change "Ключи обновлены"' 4script.sh || fail 'stage 4 does not restart SSH after key changes'
+# рестарт без валидации конфига добил бы работающий sshd
+ssh_diag=$(sed -n '/^_ssh_after_keys_change()/,/^}/p' 4script.sh)
+grep -q 'sshd -t' <<<"$ssh_diag" || fail '_ssh_after_keys_change does not validate sshd config before restart'
+grep -q 'svc_is_active "$SSH_SERVICE"' <<<"$ssh_diag" || fail '_ssh_after_keys_change does not start a stopped SSH service'
+
+# ── Удаление / замена защиты от брутфорса (этап 9) ────────────────────
+for fn in _intrusion_state pkg_remove _remove_fail2ban _remove_crowdsec; do
+	declare -F "$fn" >/dev/null || fail "missing intrusion helper: $fn"
+done
+grep -q 'Заменить на другую' 4script.sh || fail 'stage 9 has no replace option'
+grep -q 'Оставить как есть' 4script.sh || fail 'stage 9 has no keep option'
+
+# ── root должен быть в списке для ключей ─────────────────────────────
+grep -q 'get_regular_users --with-root' 4script.sh || fail 'root missing from the SSH key user list'
+sshsel=$(sed -n '/^stage_ssh_key()/,/^}/p' 4script.sh)
+grep -q -- '--with-root' <<<"$sshsel" || fail 'stage 4 does not use --with-root'
+userssel=$(sed -n '/^stage_users()/,/^}/p' 4script.sh)
+grep -q -- '--with-root' <<<"$userssel" && fail 'stage 2 must not list root as an ordinary user'
+
+# ── Единый стиль клавиш ─────────────────────────────────────────────
+# Договорённость: пункты меню — цифры, выход/пропуск — S. Буквы остаются только
+# для сервисных действий, как P/H/R/Q в главном меню.
+bad=$(grep -nE '^[[:space:]]*echo( -e)? "  [0-9]\) Пропустить' 4script.sh || true)
+[[ -z "$bad" ]] || fail "skip/exit must be S, not a digit: $bad"
+# этап 2 раньше выбивался из всех остальных меню буквами C/P/G/D
+bad=$(grep -nE '\$\{C_BOLD\}[CPGD]\)' 4script.sh || true)
+[[ -z "$bad" ]] || fail "stage 2 still uses letter action keys: $bad"
+# выход есть в каждом меню и он всегда S
+for fn in stage_utilities stage_users stage_ssh_key stage_ssh_config stage_sftp_user stage_ufw stage_dns stage_timezone stage_ipv6 stage_pam stage_disk stage_console; do
+	body=$(sed -n "/^$fn()/,/^}/p" 4script.sh)
+	grep -qE 'S\).*(Пропустить|Назад|Завершить|отмена|Пропуск)' <<<"$body" ||
+		fail "$fn has no 'S) ...' exit key"
+done
+
+# ── Подсказки для новичков ───────────────────────────────────────────
+declare -F hint >/dev/null || fail 'missing hint helper'
+grep -q 'prohibit-password — по ключу можно' 4script.sh ||
+	fail 'the SSH root-login menu lost its plain-language hint'
+grep -q '«Connection refused»' 4script.sh || fail 'SSH diagnostics lost the Connection refused hint'
+declare -F _ssh_diagnose >/dev/null || fail 'missing _ssh_diagnose'
+grep -q 'Почему не пускает SSH' 4script.sh || fail 'stage 5 has no diagnostics menu item'
+
 printf 'OK: 4script unit checks passed\n'

@@ -6,8 +6,11 @@ VPS в защищённое состояние и оставляет его об
 изменением, валидация конфигов перед каждым перезапуском.
 
 ```text
-Debian · Ubuntu · Fedora · RHEL · CentOS · Rocky · AlmaLinux · Oracle Linux
+Debian · Ubuntu · Fedora · RHEL · CentOS · Rocky · AlmaLinux · Oracle Linux · Alpine
 ```
+
+Init: `systemd` (Debian/RHEL-семейство) либо `OpenRC` (Alpine) — скрипт
+определяет сам и управляет сервисами соответствующей утилитой.
 
 [English version](README.md) · [Manual (how to do it by hand)](docs/manual.md) · [Ручные инструкции](docs/manual.ru.md)
 
@@ -74,25 +77,26 @@ sudo bash 4script.sh
 | :- | :--- | :--------- |
 |  | **Подготовка** |  |
 | 0 | Утилиты | `micro` (редактор), `mc` (файловый менеджер) |
-| 1 | Обновление | `apt-get update/upgrade/full-upgrade`, `dnf upgrade`, предупреждает о нужной перезагрузке |
+| 1 | Обновление | `apt-get update/upgrade/full-upgrade`, `dnf upgrade`, `apk -U upgrade`, предупреждает о нужной перезагрузке |
 |  | **Доступ и вход** |  |
 | 2 | Пользователи | создать, сменить пароль, группы (sudo), удалить |
 | 3 | Пароль root | смена пароля root |
-| 4 | SSH-ключ | вставить / скопировать / просмотреть / удалить, инструкции для Linux, macOS, Windows |
-| 5 | SSH-конфиг | порт, парольный вход, root-доступ, MaxAuthTries, пустые пароли, `PerSourcePenalties` |
+| 4 | SSH-ключ | вставить / скопировать / просмотреть / удалить (root в списке), формат ключа проверяется при вставке, SSH перезапускается, инструкции для Linux, macOS, Windows |
+| 5 | SSH-конфиг | порт, парольный вход, root-доступ, MaxAuthTries, пустые пароли, `PerSourcePenalties`; пояснения простыми словами и проверка «почему не пускает SSH» |
 | 6 | SFTP-юзер | chroot-пользователь в `/srv/sftp/<имя>`, запись в `upload/` |
 |  | **Защита** |  |
-| 7 | Фаервол | UFW (Debian/Ubuntu) или firewalld (RHEL-семейство); проверка IPv6, предупреждение о Docker, аудит sudo |
-| 8 | Автообновления | `unattended-upgrades` / `dnf-automatic` + окно перезагрузки |
-| 9 | От брутфорса | CrowdSec или Fail2Ban |
+| 7 | Фаервол | UFW (Debian/Ubuntu/Alpine) или firewalld (RHEL-семейство); проверка IPv6, предупреждение о Docker, аудит sudo |
+| 8 | Автообновления | `unattended-upgrades` / `dnf-automatic` + окно перезагрузки; на Alpine — ежедневная задача в `/etc/periodic/daily` |
+| 9 | От брутфорса | CrowdSec или Fail2Ban (на Alpine только Fail2Ban — CrowdSec нет в `apk`); если что-то уже стоит — оставить, заменить или удалить |
 | 10 | DNS | замена резолверов (с учётом systemd-resolved) |
 | 18 | Пароли и блокировки | `pam_faillock` (блокирует учётку, а не адрес) и `pam_pwquality` |
 | 19 | Аудит событий | `auditd` с базовыми правилами: файлы идентификации, `sudoers`, SSH-конфиг, root-команды, модули ядра |
 | 20 | IPv6 | включить или отключить IPv6 (переживает перезагрузку; замечает сессию по IPv6 до того, как её оборвёт) |
+| 21 | Локальный вход (консоль) | закрыть консоль провайдера: виртуальные tty и последовательный порт плюс root на консоли — вход остаётся только по SSH, вернуть можно одним пунктом |
 |  | **Система и сеть** |  |
 | 11 | Fish shell | установка fish |
 | 12 | Время | часовой пояс + NTP |
-| 13 | Lynis | аудит безопасности, hardening index |
+| 13 | Lynis | аудит безопасности, hardening index (на Alpine пропускается — нет в репозитории) |
 | 14 | Диск | использование, поиск больших файлов |
 | 15 | BBR | TCP congestion control |
 | 16 | Харденинг ядра | sysctl: KASLR/dmesg/core-дампы, защита hardlink/symlink, ICMP-redirect, rp_filter, SYN-куки |
@@ -237,6 +241,14 @@ cat /opt/4script/4script_*.log      # или /opt/seq_vps/seq_vps_*.log на с�
 В основном да. Часть ключей sysctl в LXC только для чтения, `auditd` не
 стартует без `cap_sys_nice`, а BBR требует модуль ядра. Скрипт честно сообщает
 об этом, а не делает вид, что всё включилось.
+
+**Работает на Alpine?**
+Да. На Alpine вместо systemd — OpenRC, поэтому сервисы управляются через
+`rc-update`/`rc-service`, пакеты — через `apk`, фаервол — UFW, автообновления —
+ежедневной задачей в `/etc/periodic/daily`. Два честных ограничения: CrowdSec и
+Lynis в репозиториях Alpine отсутствуют (этапы об этом говорят и пропускаются), а
+штатный `sshd` не слинкован с PAM — этап 18 это замечает и предлагает
+`apk add openssh-server-pam` вместо правила PAM, которое всё равно не выполнится.
 
 **Можно всё то же сделать руками?**
 Да — для этого [docs/manual.ru.md](docs/manual.ru.md) и

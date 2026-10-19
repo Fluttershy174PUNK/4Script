@@ -5,8 +5,11 @@ keeps it maintainable: interactive menu on the server or fully remote setup from
 your laptop, backups before every change, config validation before every restart.
 
 ```text
-Debian · Ubuntu · Fedora · RHEL · CentOS · Rocky · AlmaLinux · Oracle Linux
+Debian · Ubuntu · Fedora · RHEL · CentOS · Rocky · AlmaLinux · Oracle Linux · Alpine
 ```
+
+Init: `systemd` (Debian/RHEL family) or `OpenRC` (Alpine) — the script detects
+which one it is and drives services through the matching tool.
 
 [Русская версия](README.ru.md) · [Manual (how to do it by hand)](docs/manual.md) · [Ручные инструкции](docs/manual.ru.md)
 
@@ -73,25 +76,26 @@ Stages are grouped; each one can be run alone, and status is remembered in
 | :- | :--- | :----------- |
 |  | **Setup** |  |
 | 0 | Utilities | `micro` (editor), `mc` (file manager) |
-| 1 | System update | `apt-get update/upgrade/full-upgrade`, `dnf upgrade`, warns when a reboot is required |
+| 1 | System update | `apt-get update/upgrade/full-upgrade`, `dnf upgrade`, `apk -U upgrade`, warns when a reboot is required |
 |  | **Access** |  |
 | 2 | Users | create, change password, groups (sudo), delete |
 | 3 | Root password | change the root password |
-| 4 | SSH key | paste / copy / list / remove keys, client instructions for Linux, macOS, Windows |
-| 5 | SSH config | port, password login, root login, MaxAuthTries, empty passwords, `PerSourcePenalties` |
+| 4 | SSH key | paste / copy / list / remove keys (root included), key format checked on paste, SSH restarted afterwards, client instructions for Linux, macOS, Windows |
+| 5 | SSH config | port, password login, root login, MaxAuthTries, empty passwords, `PerSourcePenalties`; plain-language hints and a "why is SSH refusing me" check |
 | 6 | SFTP user | chroot user in `/srv/sftp/<name>`, writable `upload/` |
 |  | **Protection** |  |
-| 7 | Firewall | UFW (Debian/Ubuntu) or firewalld (RHEL family); IPv6 check, Docker warning, sudo audit |
-| 8 | Auto-updates | `unattended-upgrades` / `dnf-automatic` + reboot window |
-| 9 | Brute force | CrowdSec or Fail2Ban |
+| 7 | Firewall | UFW (Debian/Ubuntu/Alpine) or firewalld (RHEL family); IPv6 check, Docker warning, sudo audit |
+| 8 | Auto-updates | `unattended-upgrades` / `dnf-automatic` + reboot window; on Alpine a daily `/etc/periodic/daily` job |
+| 9 | Brute force | CrowdSec or Fail2Ban (Alpine: Fail2Ban only — CrowdSec is not in `apk`); if one is already installed you can keep it, replace it or remove it |
 | 10 | DNS | replace resolvers (systemd-resolved aware) |
 | 18 | Passwords and lockout | `pam_faillock` (locks the account, not the address) and `pam_pwquality` |
 | 19 | Event audit | `auditd` with baseline rules: identity files, `sudoers`, SSH config, root commands, kernel modules |
 | 20 | IPv6 | turn IPv6 on or off (survives reboot, detects an IPv6 SSH session before cutting it) |
+| 21 | Local login (console) | close the provider's console: virtual ttys and the serial port, plus root on the console — SSH stays the only way in, with a one-key way back |
 |  | **System and network** |  |
 | 11 | Fish shell | install fish |
 | 12 | Time | timezone + NTP |
-| 13 | Lynis | security audit, hardening index |
+| 13 | Lynis | security audit, hardening index (skipped on Alpine — not packaged) |
 | 14 | Disk | usage, large files |
 | 15 | BBR | TCP congestion control |
 | 16 | Kernel hardening | sysctl: KASLR/dmesg/core dumps, hardlink/symlink guards, ICMP redirects, rp_filter, SYN cookies |
@@ -238,6 +242,15 @@ cat /opt/4script/4script_*.log      # or /opt/seq_vps/seq_vps_*.log on old insta
 Mostly. Some sysctl keys are read-only in LXC, `auditd` cannot start without
 `cap_sys_nice`, and BBR needs a kernel module. The script reports exactly that
 instead of pretending it worked.
+
+**Does it work on Alpine?**
+Yes. Alpine uses OpenRC instead of systemd, so services are driven through
+`rc-update`/`rc-service`, packages through `apk`, UFW as the firewall, and
+automatic updates through a daily `/etc/periodic/daily` job. Two honest limits:
+CrowdSec and Lynis are not in the Alpine repositories (the stages say so and
+skip), and the stock `sshd` is not linked against PAM — stage 18 detects that
+and points to `apk add openssh-server-pam` instead of writing a PAM rule that
+would never run.
 
 **Can I do everything by hand instead?**
 Yes — that is what [docs/manual.md](docs/manual.md) and

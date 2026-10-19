@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # 4script.sh — 4Script: простой скрипт защиты сервера (simple-server-security-script)
-# Debian/Ubuntu · Fedora/RHEL/CentOS · Rocky · AlmaLinux
+# Debian/Ubuntu · Fedora/RHEL/CentOS · Rocky · AlmaLinux · Alpine
+# Сервисы: systemd (systemctl) либо OpenRC (rc-service/rc-update) — определяется автоматически.
 #
 # Использование: sudo ./4script.sh [--help]
 #
@@ -95,6 +96,17 @@ DISTRO_NAME=""
 SSH_SERVICE=""
 SUDO_GROUP=""
 HAS_SELINUX=false
+INIT_SYSTEM=""
+HAS_SYSTEMD=false
+HAS_OPENRC=false
+APK_TOOLS_DONE=false
+# true только если sshd собран с PAM (Alpine: пакет openssh-server-pam).
+# Без него pam_faillock на SSH не действует вообще.
+SSHD_HAS_PAM=false
+# Пути стеков PAM: задаёт _pam_file_names (Alpine — base-*, Debian/Ubuntu — common-*).
+PAM_AUTH_FILE=""
+PAM_ACCOUNT_FILE=""
+PAM_PASSWORD_FILE=""
 
 readonly SCRIPT_VERSION="2.0"
 
@@ -126,6 +138,7 @@ readonly STAGE_DEFS=(
 	"18|stage18_pam|🔐|Пароли и блокировки (PAM)|protect|stage_pam"
 	"19|stage19_auditd|📋|Аудит событий (auditd)|protect|stage_auditd"
 	"20|stage20_ipv6|🌐|IPv6: включить или отключить|protect|stage_ipv6"
+	"21|stage21_console|🖥|Локальный вход (консоль)|protect|stage_console"
 )
 readonly CATEGORY_ORDER=(setup access protect system)
 
@@ -292,6 +305,10 @@ confirm() {
 	[[ "$default" == "y" ]] && { [[ "$answer" != "n" && "$answer" != "N" ]]; } || { [[ "$answer" == "y" || "$answer" == "Y" ]]; }
 }
 
+# Пояснение под пунктом меню — для тех, кто видит эти слова впервые.
+# Цвета через %b: в C_* лежит литерал \033, а не готовый escape.
+hint() { printf '    %b%s%b\n' "$C_DIM" "$1" "$C_RESET"; }
+
 # Меню — цветной пункт со статусом
 menu_item() {
 	local num="$1" stage="$2" text="$3"
@@ -334,31 +351,71 @@ menu_item() {
 #  ИНИЦИАЛИЗАЦИЯ
 # ═══════════════════════════════════════════════════════════════════
 
+# Чистая функция без побочных эффектов: ID из /etc/os-release → имя пакетного
+# менеджера. Вынесена, чтобы её можно было проверять тестом (detect_distro делает
+# ещё и systemctl/rc-service и завершает скрипт на неизвестном дистрибутиве).
+_pkg_mgr_for_id() {
+	case "$1" in
+	debian | ubuntu | linuxmint | pop | raspbian) echo apt ;;
+	fedora | rhel | centos | rocky | almalinux | ol)
+		command -v dnf &>/dev/null && echo dnf || echo yum
+		;;
+	alpine | postmarketos) echo apk ;;
+	*) return 1 ;;
+	esac
+}
+
 detect_distro() {
 	if [[ -f /etc/os-release ]]; then
 		source /etc/os-release
 	fi
 
-	if [[ "${ID:-}" =~ ^(debian|ubuntu|linuxmint|pop|raspbian)$ ]]; then
-		PKG_MGR="apt"
-		DISTRO_NAME="${PRETTY_NAME:-Debian/Ubuntu}"
-		SUDO_GROUP="sudo"
-		if systemctl list-unit-files 2>/dev/null | grep -q "^ssh.service"; then
+	PKG_MGR=$(_pkg_mgr_for_id "${ID:-}") || {
+		echo -e "${C_RED}${ICON_FAIL}  Неподдерживаемый дистрибутив: ${ID:-неизвестно}${C_RESET}"
+		echo "  Поддерживаются: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux, Alpine"
+		exit 1
+	}
+	DISTRO_NAME="${PRETTY_NAME:-$ID}"
+
+	case "$PKG_MGR" in
+	apt | dnf | yum) SUDO_GROUP="$([[ "$PKG_MGR" == apt ]] && echo sudo || echo wheel)" ;;
+	apk) SUDO_GROUP="wheel" ;;
+	esac
+
+	# init: на Alpine systemd нет вообще, сервисами рулит OpenRC.
+	INIT_SYSTEM="openrc"
+	HAS_SYSTEMD=false
+	if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+		INIT_SYSTEM="systemd"
+		HAS_SYSTEMD=true
+	fi
+	HAS_OPENRC=false
+	command -v rc-service &>/dev/null && command -v rc-update &>/dev/null && HAS_OPENRC=true
+	# Ни systemd, ни OpenRC: скрипт отработает, но сервисы запускать нечем —
+	# об этом лучше сказать сразу, чем падать на середине этапа
+	if ! $HAS_SYSTEMD && ! $HAS_OPENRC; then
+		INIT_SYSTEM="none"
+		log_warn "Не найден ни systemd, ни OpenRC: сервисы (sshd, UFW, Fail2Ban) придётся запускать вручную"
+	fi
+
+	if $HAS_SYSTEMD; then
+		if systemctl list-unit-files 2>/dev/null | grep -q "^ssh\.service"; then
 			SSH_SERVICE="ssh"
-		elif systemctl list-unit-files 2>/dev/null | grep -q "^sshd.service"; then
+		elif systemctl list-unit-files 2>/dev/null | grep -q "^sshd\.service"; then
 			SSH_SERVICE="sshd"
 		else
 			SSH_SERVICE="ssh"
 		fi
-	elif [[ "${ID:-}" =~ ^(fedora|rhel|centos|rocky|almalinux|ol)$ ]]; then
-		DISTRO_NAME="${PRETTY_NAME:-Fedora/RHEL/CentOS}"
-		SUDO_GROUP="wheel"
-		SSH_SERVICE="sshd"
-		PKG_MGR=$(command -v dnf &>/dev/null && echo "dnf" || echo "yum")
 	else
-		echo -e "${C_RED}${ICON_FAIL}  Неподдерживаемый дистрибутив: ${ID:-неизвестно}${C_RESET}"
-		echo "  Поддерживаются: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux"
-		exit 1
+		# в OpenRC имя сервиса = имя init-скрипта, на Alpine это sshd
+		SSH_SERVICE="sshd"
+	fi
+
+	# sshd с PAM: только тогда pam_faillock реально влияет на вход по SSH
+	if [[ "${ID:-}" == alpine ]] && apk info -e openssh-server-pam &>/dev/null; then
+		SSHD_HAS_PAM=true
+	elif [[ -f /etc/pam.d/sshd ]]; then
+		SSHD_HAS_PAM=true
 	fi
 
 	# SELinux: на RHEL-семействе без semanage sshd не поднимется на нестандартном порту
@@ -366,10 +423,100 @@ detect_distro() {
 		HAS_SELINUX=true
 	fi
 
-	# Адаптируем ширину под терминал
+	# Адаптируем ширину под терминал. На Alpine нет tput (ncurses) — тогда 80.
 	TERM_WIDTH=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
 	((TERM_WIDTH > 100)) && TERM_WIDTH=100
 	((TERM_WIDTH < 60)) && TERM_WIDTH=60
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  СЕРВИСЫ: systemd (systemctl) либо OpenRC (rc-service/rc-update)
+# ═══════════════════════════════════════════════════════════════════
+# Всё, что раньше звало systemctl напрямую, идёт через этот слой: на Alpine
+# systemctl отсутствует, а имя сервиса в OpenRC — это имя файла /etc/init.d/X.
+# systemd-only вещи (сокет-активация ssh.socket, таймеры) остаются под
+# проверкой $HAS_SYSTEMD.
+
+svc_is_active() { # svc_is_active <имя>
+	if $HAS_SYSTEMD; then
+		systemctl is-active --quiet "$1" 2>/dev/null
+	else
+		rc-service "$1" status &>/dev/null
+	fi
+}
+
+svc_is_enabled() { # включён в автозагрузку
+	if $HAS_SYSTEMD; then
+		systemctl is-enabled --quiet "$1" 2>/dev/null
+	else
+		# rc-update show печатает «  имя | runlevel»
+		rc-update show 2>/dev/null | grep -qE "^[[:space:]]*$1[[:space:]]*\|"
+	fi
+}
+
+svc_start() {
+	if $HAS_SYSTEMD; then
+		systemctl start "$1" 2>/dev/null
+	else
+		rc-service "$1" start &>/dev/null
+	fi
+}
+
+svc_stop() {
+	if $HAS_SYSTEMD; then
+		systemctl stop "$1" 2>/dev/null
+	else
+		rc-service "$1" stop &>/dev/null
+	fi
+}
+
+svc_restart() {
+	if $HAS_SYSTEMD; then
+		systemctl restart "$1" 2>/dev/null
+	else
+		rc-service "$1" restart &>/dev/null
+	fi
+}
+
+svc_reload() {
+	if $HAS_SYSTEMD; then
+		systemctl reload "$1" 2>/dev/null
+	else
+		rc-service "$1" reload &>/dev/null
+	fi
+}
+
+svc_enable() {
+	if $HAS_SYSTEMD; then
+		systemctl enable "$1" 2>/dev/null
+	else
+		rc-update add "$1" default &>/dev/null
+	fi
+}
+
+svc_disable() {
+	if $HAS_SYSTEMD; then
+		systemctl disable "$1" 2>/dev/null
+	else
+		rc-update del "$1" default &>/dev/null
+	fi
+}
+
+svc_enable_now() { svc_enable "$1" || true; svc_start "$1" || true; }
+
+svc_disable_now() { svc_stop "$1" || true; svc_disable "$1" || true; }
+
+svc_daemon_reload() {
+	$HAS_SYSTEMD && systemctl daemon-reload 2>/dev/null || true
+}
+
+# Есть ли init-скрипт/юнит вообще (иначе rc-service шумит «does not exist»)
+svc_exists() {
+	if $HAS_SYSTEMD; then
+		systemctl list-unit-files 2>/dev/null | grep -q "^$1\.\(service\|timer\|socket\)"
+	else
+		[[ -x "/etc/init.d/$1" ]]
+	fi
 }
 
 # Шаблон статус-файла в stdout: генератор отдельно от файла, чтобы можно было
@@ -487,10 +634,38 @@ _sshd_version_at_least() {
 	printf '%s\n%s\n' "$need" "$ver" | sort -V -C
 }
 
+# Имена файлов по маске одной строкой (замена find -printf '%f ')
+_conf_names() {
+	local d="$1" f
+	shopt -s nullglob
+	for f in "$d"/*.conf; do printf '%s ' "$(basename "$f")"; done
+	shopt -u nullglob
+}
+
+# Первый IPv4-адрес сервера. hostname -I есть в GNU-hostname, но не в busybox
+# (Alpine) — там выручает ip из iproute2. Печатает пусто, если узнать нечем.
+_server_ip() {
+	local ip
+	ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+	[[ -n "$ip" ]] || ip=$(ip -4 addr show scope global 2>/dev/null |
+		awk '/^[[:space:]]*inet /{sub(/\/.*/,"",$2); print $2; exit}')
+	printf '%s' "$ip"
+}
+
 get_regular_users() {
+	local with_root="${1:-}"
 	while IFS=: read -r user _ uid _ _ home shell; do
-		[[ $uid -ge 1000 ]] || continue
-		[[ "$shell" != "/usr/sbin/nologin" && "$shell" != "/bin/false" && "$shell" != "/sbin/nologin" ]] || continue
+		if [[ "$user" == root ]]; then
+			# root нужен там, где речь о входе (SSH-ключи): на свежем сервере
+			# он вообще единственная учётка, которой можно положить ключ
+			[[ "$with_root" == "--with-root" ]] || continue
+		else
+			# 65534 — nobody: он >= 1000, но это не живая учётка
+			[[ $uid -ge 1000 && $uid -lt 65534 ]] || continue
+		fi
+		# nologin на разных ОС лежит по разному пути (/sbin, /usr/sbin, /usr/bin),
+		# поэтому шаблон, а не список — иначе учётка попадает в меню входа
+		[[ "$shell" == */nologin || "$shell" == */false ]] && continue
 		local groups
 		groups=$(groups "$user" 2>/dev/null | cut -d: -f2 | xargs)
 		echo "$user:$uid:$groups:$home"
@@ -532,7 +707,7 @@ show_server_summary() {
 	echo -e "\n${C_BOLD}${ICON_LOCK}  SFTP пользователи:${C_RESET}"
 	local has_sftp=false
 	while IFS=: read -r user _ uid _ _ home shell; do
-		[[ "$shell" == "/usr/sbin/nologin" || "$shell" == "/bin/false" ]] || continue
+		[[ "$shell" == */nologin || "$shell" == "/bin/false" ]] || continue
 		# 1000..65533: исключаем nobody (65534) и прочие системные
 		[[ $uid -ge 1000 && $uid -lt 65534 ]] || continue
 		has_sftp=true
@@ -601,7 +776,8 @@ show_server_summary() {
 	if [[ -d "$SSHD_CONFIG_D" ]]; then
 		local confs
 		confs=$(find "$SSHD_CONFIG_D" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l)
-		[[ $confs -gt 0 ]] && echo -e "  drop-in: ${C_DIM}$(find "$SSHD_CONFIG_D" -maxdepth 1 -name '*.conf' -printf '%f ' 2>/dev/null)${C_RESET}"
+	# busybox find не умеет -printf: откатываемся на basename в цикле
+		[[ $confs -gt 0 ]] && echo -e "  drop-in: ${C_DIM}$(_conf_names "$SSHD_CONFIG_D")${C_RESET}"
 	fi
 
 	# ── Фаервол (UFW / firewalld) ──
@@ -633,7 +809,7 @@ show_server_summary() {
 		has_idps=true
 		echo -e "  ${C_GREEN}● CrowdSec установлен${C_RESET}"
 	}
-	systemctl is-active --quiet fail2ban 2>/dev/null && {
+	svc_is_active fail2ban && {
 		has_idps=true
 		echo -e "  ${C_GREEN}● Fail2Ban запущен${C_RESET}"
 	}
@@ -647,7 +823,7 @@ show_server_summary() {
 
 	# ── Подключение ──
 	local ip_addr
-	ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+	ip_addr=$(_server_ip)
 	echo -e "\n${C_BOLD}${ICON_ARROW}  Подключение:${C_RESET}"
 	echo -e "  ${C_GREEN}ssh${C_RESET} -p $CURRENT_SSH_PORT user@${ip_addr:-<server_ip>}"
 
@@ -664,7 +840,7 @@ show_server_summary() {
 		ufw status 2>/dev/null | grep -q "Status: active" && fw_active=true
 	fi
 	$fw_active || echo -e "  ${C_YELLOW}${ICON_WARN}  Фаервол неактивен — этап 7${C_RESET}"
-	if ! command -v cscli &>/dev/null && ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+	if ! command -v cscli &>/dev/null && ! svc_is_active fail2ban; then
 		echo -e "  ${C_YELLOW}${ICON_WARN}  Защита от атак не установлена — этап 9${C_RESET}"
 	fi
 
@@ -678,6 +854,14 @@ show_server_summary() {
 
 pkg_install_retry() {
 	local pkg="$1" max=3 retry=0
+	# apk возвращает ненулевой код и когда пакет реально установлен: например
+	# не может выставить владельца служебного каталога в контейнере. Верить
+	# только коду возврата нельзя — иначе этап Fail2Ban «проваливается» при
+	# живом fail2ban-client. Поэтому на Alpine проверяем сам факт установки.
+	if [[ "$PKG_MGR" == apk ]] && apk info -e "$pkg" &>/dev/null; then
+		log_info "$pkg уже установлен"
+		return 0
+	fi
 	while [[ $retry -lt $max ]]; do
 		log_info "Установка ${C_BOLD}$pkg${C_RESET} (попытка $((retry + 1))/$max)..."
 		spinner_start "Устанавливаем $pkg..."
@@ -690,6 +874,16 @@ pkg_install_retry() {
 			spinner_stop
 			return 0
 		} ;;
+		# apk без --no-cache обновляет индекс отдельно; -q чтобы не сыпать версии
+		apk) apk add --no-cache -q "$pkg" &>/dev/null && {
+			spinner_stop
+			return 0
+		}
+			apk info -e "$pkg" &>/dev/null && {
+				spinner_stop
+				log_warn "$pkg установлен, но apk вернул ошибку (владельцы файлов) — продолжаем"
+				return 0
+			} ;;
 		esac
 		spinner_stop
 		retry=$((retry + 1))
@@ -718,7 +912,35 @@ repair_pkg() {
 		yum clean all 2>/dev/null || true
 		yum makecache 2>/dev/null || true
 		;;
+	apk) apk update &>/dev/null || true ;;
 	esac
+}
+
+# Утилиты, которые есть в coreutils/findutils/iproute2, но НЕ в busybox Alpine:
+#   find -printf, sort -h/-V, hostname -I
+# Ставим один раз на первом этапе, который до них дотянется: иначе проверки
+# молча дают пустой результат на живом сервере.
+_ensure_base_tools() {
+	[[ "$PKG_MGR" == apk ]] || return 0
+	$APK_TOOLS_DONE && return 0
+	APK_TOOLS_DONE=true
+	local need=()
+	# busybox find/sort/hostname не умеют нужных ключей — ставим GNU-версии
+	[[ "$(find --version 2>/dev/null)" == *GNU* ]] || need+=(findutils)
+	[[ "$(sort --version 2>/dev/null)" == *GNU* ]] || need+=(coreutils)
+	command -v ss &>/dev/null || need+=(iproute2)
+	[[ ${#need[@]} -eq 0 ]] && return 0
+	log_info "Alpine: ставлю базовые утилиты (${need[*]})..."
+	# код возврата apk ненадёжен (см. pkg_install_retry) — проверяем факт установки
+	apk add --no-cache -q "${need[@]}" &>>"$LOG_FILE" || _apk_all_installed "${need[@]}" ||
+		log_warn "Не удалось поставить: ${need[*]}"
+}
+
+# Установлен ли каждый пакет (независимо от кода возврата apk)
+_apk_all_installed() {
+	local p
+	for p in "$@"; do apk info -e "$p" &>/dev/null || return 1; done
+	return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -728,10 +950,12 @@ repair_pkg() {
 stage_utilities() {
 	stage_banner "$ICON_GEAR" "0" "Установка утилит"
 
-	echo "  ${C_BOLD}1)${C_RESET} micro  ${C_DIM}— удобный редактор${C_RESET}"
-	echo "  ${C_BOLD}2)${C_RESET} mc     ${C_DIM}— файловый менеджер${C_RESET}"
-	echo "  ${C_BOLD}3)${C_RESET} Обе утилиты"
-	echo "  ${C_BOLD}0)${C_RESET} Пропустить"
+	_ensure_base_tools
+
+	echo -e "  ${C_BOLD}1)${C_RESET} micro  ${C_DIM}— удобный редактор${C_RESET}"
+	echo -e "  ${C_BOLD}2)${C_RESET} mc     ${C_DIM}— файловый менеджер${C_RESET}"
+	echo -e "  ${C_BOLD}3)${C_RESET} Обе утилиты"
+	echo -e "  ${C_BOLD}S)${C_RESET} Пропустить"
 	echo ""
 	read -rp "  ${ICON_ARROW} " choice
 	echo ""
@@ -762,6 +986,9 @@ stage_update() {
 	dnf | yum)
 		[[ -d "/etc/yum.repos.d" ]] && backup_file "/etc/yum.repos.d" "stage1_update"
 		;;
+	apk)
+		backup_file "/etc/apk/repositories" "stage1_update"
+		;;
 	esac
 
 	log_info "Обновление списка пакетов..."
@@ -771,6 +998,7 @@ stage_update() {
 		case "$PKG_MGR" in
 		apt) apt-get update &>/dev/null && break ;;
 		dnf | yum) $PKG_MGR update -y &>/dev/null && break ;;
+		apk) apk update &>/dev/null && break ;;
 		esac
 		retry=$((retry + 1))
 		[[ $retry -lt $max ]] && {
@@ -792,6 +1020,8 @@ stage_update() {
 		$PKG_MGR upgrade -y &>/dev/null || true
 		$PKG_MGR autoremove -y &>/dev/null || true
 		;;
+	# --available: «upgrade» на Alpine обновляет и ядро, и зависимости пакета
+	apk) apk -U upgrade --available &>>"$LOG_FILE" || true ;;
 	esac
 	spinner_stop
 
@@ -799,6 +1029,10 @@ stage_update() {
 	# без перезагрузки работает старое ядро/библиотеки — скажем об этом явно
 	if [[ -f /var/run/reboot-required || -f /run/reboot-required ]]; then
 		log_warn "Требуется перезагрузка (обновлено ядро или системные пакеты): reboot"
+	fi
+	# Alpine меняет ядро отдельным пакетом — признак именно linux-* в списке апгрейдов
+	if [[ "$PKG_MGR" == apk ]] && grep -qE '^linux-[a-z0-9-]+ ' /var/log/apk.log 2>/dev/null; then
+		log_warn "Обновлён пакет ядра — перезагрузка нужна: reboot"
 	fi
 	update_stage_status "stage1_update" "completed"
 }
@@ -821,12 +1055,12 @@ stage_users() {
 	[[ ${#users[@]} -eq 0 ]] && echo -e "  ${C_DIM}(нет обычных пользователей)${C_RESET}"
 
 	echo ""
-	echo -e "  ${C_BOLD}C)${C_RESET} Создать нового"
+	echo -e "  ${C_BOLD}1)${C_RESET} Создать нового"
 
 	[[ ${#users[@]} -gt 0 ]] && {
-		echo -e "  ${C_BOLD}P)${C_RESET} Сменить пароль"
-		echo -e "  ${C_BOLD}G)${C_RESET} Группы"
-		echo -e "  ${C_BOLD}D)${C_RESET} Удалить"
+		echo -e "  ${C_BOLD}2)${C_RESET} Сменить пароль"
+		echo -e "  ${C_BOLD}3)${C_RESET} Группы"
+		echo -e "  ${C_BOLD}4)${C_RESET} Удалить"
 	}
 	echo -e "  ${C_BOLD}S)${C_RESET} Пропустить"
 	echo ""
@@ -834,7 +1068,7 @@ stage_users() {
 	echo ""
 
 	case "${action,,}" in
-	c)
+	1)
 		read -rp "  Имя пользователя: " username
 		[[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
 			log_err "Имя: латиница в нижнем регистре, цифры, _ и -"
@@ -846,12 +1080,15 @@ stage_users() {
 		}
 		local pw
 		_read_new_password pw || return 1
-		useradd -m -s /bin/bash "$username"
+		# на Alpine bash по умолчанию не установлен — /bin/bash не пустил бы никого
+		local shell_f="/bin/bash"
+		[[ -x /bin/bash ]] || shell_f="/bin/ash"
+		useradd -m -s "$shell_f" "$username"
 		echo "$username:$pw" | chpasswd
 		usermod -aG "$SUDO_GROUP" "$username"
 		log_ok "Пользователь ${C_BOLD}$username${C_RESET} создан (группа $SUDO_GROUP)"
 		;;
-	p)
+	2)
 		[[ ${#users[@]} -eq 0 ]] && {
 			log_err "Нет пользователей"
 			return 1
@@ -867,7 +1104,7 @@ stage_users() {
 		echo "$u:$pw" | chpasswd
 		log_ok "Пароль ${C_BOLD}$u${C_RESET} изменён"
 		;;
-	g)
+	3)
 		[[ ${#users[@]} -eq 0 ]] && {
 			log_err "Нет пользователей"
 			return 1
@@ -912,13 +1149,17 @@ stage_users() {
 			;;
 		5)
 			echo ""
-			cut -d: -f1 /etc/group | sort | column | sed 's/^/  /'
-			echo ""
+			if command -v column &>/dev/null; then
+				cut -d: -f1 /etc/group | sort | column | sed 's/^/  /'
+			else
+				cut -d: -f1 /etc/group | sort | sed 's/^/  /'
+			fi
+			echo """"
 			;;
 		*) log_info "Назад" ;;
 		esac
 		;;
-	d)
+	4)
 		[[ ${#users[@]} -eq 0 ]] && {
 			log_err "Нет пользователей"
 			return 1
@@ -933,7 +1174,14 @@ stage_users() {
 		if confirm "Удалить пользователя ${C_BOLD}$u${C_RESET}?"; then
 			gpasswd -d "$u" sudo 2>/dev/null || true
 			gpasswd -d "$u" wheel 2>/dev/null || true
-			userdel -r "$u" 2>/dev/null || userdel "$u" 2>/dev/null || true
+			if [[ "$PKG_MGR" == apk ]]; then
+				# busybox/shadow userdel на Alpine не чистит /home и cron — делаем сами
+				userdel "$u" 2>/dev/null || true
+				[[ -n "$u" ]] && rm -rf "/home/${u:?}" 2>/dev/null || true
+				crontab -u "$u" -r 2>/dev/null || true
+			else
+				userdel -r "$u" 2>/dev/null || userdel "$u" 2>/dev/null || true
+			fi
 			log_ok "Пользователь $u удалён"
 		else
 			log_info "Отмена"
@@ -969,13 +1217,15 @@ stage_ssh_key() {
 
 	echo -e "${C_BOLD}▸ Пользователи и ключи:${C_RESET}"
 	local users=() idx=1
+	# меняли ли ключи: если да — в конце перезапустим SSH (см. _ssh_after_keys_change)
+	local keys_changed=false
 	while IFS=: read -r user uid groups home; do
 		local ki="${C_DIM}нет${C_RESET}"
 		[[ -f "$home/.ssh/authorized_keys" && -s "$home/.ssh/authorized_keys" ]] && ki="${C_GREEN}да ($(wc -l <"$home/.ssh/authorized_keys") шт.)${C_RESET}"
 		echo -e "  ${C_BOLD}$idx)${C_RESET} ${C_BOLD}$user${C_RESET}  ключи: $ki"
 		users+=("$user")
 		idx=$((idx + 1))
-	done < <(get_regular_users)
+	done < <(get_regular_users --with-root)
 	[[ ${#users[@]} -eq 0 ]] && {
 		log_err "Нет пользователей"
 		return 1
@@ -1030,26 +1280,37 @@ stage_ssh_key() {
 	read -rp "  ${ICON_ARROW} " ka
 
 	local srv_ip
-	srv_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+	srv_ip=$(_server_ip)
 	srv_ip=${srv_ip:-<server_ip>}
 
 	case "$ka" in
 	1)
 		echo ""
-		echo "  Вставьте публичный ключ (ssh-ed25519 AAAA...):"
+		echo "  Вставьте публичный ключ целиком, одной строкой (ssh-ed25519 AAAA...):"
 		read -r pk
 		[[ -z "$pk" ]] && {
 			log_err "Ключ пуст"
 			return 1
 		}
-		if ! echo "$pk" | grep -qE '^(ssh-|ecdsa-|sk-ssh)'; then
+		# Обрезанная при копировании строка выглядит «похоже на ключ», но sshd
+		# её молча игнорирует — потом человек гадает, почему ключ не пускает.
+		# Поэтому спрашиваем у ssh-keygen, разбирается ли строка вообще.
+		if ! printf '%s\n' "$pk" | ssh-keygen -l -f - &>/dev/null; then
+			log_err "Ключ не читается: скорее всего строка обрезана или склеена"
+			hint "у ed25519 base64-часть — ровно 68 символов, плюс пробел и комментарий"
+			hint "скопируйте строку из файла ~/.ssh/id_ed25519.pub целиком"
+			confirm "Всё равно добавить?" || return 1
+		elif ! printf '%s\n' "$pk" | grep -qE '^(ssh-|ecdsa-|sk-ssh|sk-ecdsa)'; then
 			log_warn "Не похоже на SSH-ключ"
 			confirm "Продолжить?" || return 1
 		fi
 		echo "$pk" >>"$ssh_dir/authorized_keys"
 		chown "$SSH_KEY_USER:$SSH_KEY_USER" "$ssh_dir/authorized_keys"
 		chmod 600 "$ssh_dir/authorized_keys"
+		keys_changed=true
 		log_ok "Ключ добавлен для ${C_BOLD}$SSH_KEY_USER${C_RESET}"
+		echo -e "  ${C_DIM}Проверьте вход в НОВОМ окне: ssh -i <ключ> -p $CURRENT_SSH_PORT $SSH_KEY_USER@<адрес>${C_RESET}"
+		hint "не пускает — этап 5, пункт 8 «Почему не пускает SSH»"
 		;;
 	2)
 		echo ""
@@ -1060,7 +1321,7 @@ stage_ssh_key() {
 			echo "  $si) $user ($(wc -l <"$home/.ssh/authorized_keys") ключей)"
 			sus+=("$user")
 			si=$((si + 1))
-		done < <(get_regular_users)
+		done < <(get_regular_users --with-root)
 		[[ ${#sus[@]} -eq 0 ]] && {
 			log_warn "Нет пользователей с ключами"
 			return 1
@@ -1076,6 +1337,7 @@ stage_ssh_key() {
 		cat "$sh/.ssh/authorized_keys" >>"$ssh_dir/authorized_keys"
 		chown "$SSH_KEY_USER:$SSH_KEY_USER" "$ssh_dir/authorized_keys"
 		chmod 600 "$ssh_dir/authorized_keys"
+		keys_changed=true
 		log_ok "Ключи от $su скопированы для $SSH_KEY_USER"
 		;;
 	3)
@@ -1090,7 +1352,7 @@ stage_ssh_key() {
 			[[ -f "$home/.ssh/authorized_keys" && -s "$home/.ssh/authorized_keys" ]] || continue
 			echo -e "\n${C_BOLD}▸ $user${C_RESET} ($home/.ssh/authorized_keys):"
 			cat -n "$home/.ssh/authorized_keys"
-		done < <(get_regular_users)
+		done < <(get_regular_users --with-root)
 		shopt -s nullglob
 		sftp_keys=(/etc/ssh/keys.d/*.pub)
 		shopt -u nullglob
@@ -1122,6 +1384,7 @@ stage_ssh_key() {
 			return 1
 		}
 		sed -i "${kn}d" "$ssh_dir/authorized_keys"
+		keys_changed=true
 		log_ok "Ключ $kn удалён"
 		;;
 	6)
@@ -1157,6 +1420,7 @@ stage_ssh_key() {
 		;;
 	*) log_info "Пропущено" ;;
 	esac
+	$keys_changed && _ssh_after_keys_change "Ключи обновлены"
 	update_stage_status "stage4_ssh_key" "completed"
 }
 
@@ -1183,6 +1447,7 @@ _selinux_ssh_port() {
 # ssh.socket, а Port из sshd_config игнорируется. Без правки сокета смена
 # порта «проходит», но старый порт продолжает слушать — а новый нет.
 _ssh_socket_active() {
+	$HAS_SYSTEMD || return 1
 	systemctl is-active --quiet ssh.socket 2>/dev/null && return 0
 	systemctl is-enabled --quiet ssh.socket 2>/dev/null && return 0
 	return 1
@@ -1198,7 +1463,7 @@ _ssh_socket_active() {
 # Поэтому: явный Port в drop-in + замена всех чужих Port-файлов (бэкап сохранён).
 _ssh_socket_port() {
 	local port="$1"
-	systemctl is-active --quiet ssh.socket 2>/dev/null || return 0
+	_ssh_socket_active || return 0
 
    # 1. новое значение в сокете (сброс предыдущих ListenStream)
 	local dir="/etc/systemd/system/ssh.socket.d"
@@ -1227,7 +1492,7 @@ EOF
 	done
 	shopt -u nullglob
 
-	systemctl daemon-reload 2>/dev/null || true
+	svc_daemon_reload
 }
 
 _ssh_validate() {
@@ -1253,7 +1518,7 @@ _sshd_config_ok() {
 
 # Перезапуск SSH (с сокетом, если он есть) + проверка, что порт реально слушается
 _ssh_restart() {
-	systemctl restart "$SSH_SERVICE" 2>/dev/null || {
+	svc_restart "$SSH_SERVICE" || {
 		log_err "Не удалось перезапустить $SSH_SERVICE"
 		return 1
 	}
@@ -1271,7 +1536,7 @@ _ssh_restart() {
 		log_ok "SSH слушает на порту $CURRENT_SSH_PORT"
 	else
 		if _ssh_socket_active; then
-			log_warn "Порт $CURRENT_SSH_PORT не слушается — проверьте: systemctl cat ssh.socket"
+			log_warn "Порт $CURRENT_SSH_PORT не слушается — проверьте: systemctl cat ssh.socket / rc-service sshd status"
 		else
 			log_warn "Не удалось проверить порт $CURRENT_SSH_PORT"
 		fi
@@ -1316,7 +1581,7 @@ _ssh_restart() {
 # закрыло бы старый порт без основания.
 _ssh_port_reachable() {
 	local port="$1" ip
-	ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+	ip=$(_server_ip)
 	[[ -n "$ip" ]] || return 1
 	if command -v nc &>/dev/null; then
 		nc -z -w 3 "$ip" "$port" &>/dev/null
@@ -1498,6 +1763,143 @@ _fw_cmd() {
 	[[ "$PKG_MGR" == dnf || "$PKG_MGR" == yum ]] && echo firewalld || echo ufw
 }
 
+# После правки ключей SSH надо перезапустить — и вот почему это не формальность:
+# если служба вообще не запущена (свежий сервер, сломанный автостарт), ключ не
+# заработает никогда, и человек ищет причину в ключе. Плюс перезапуск снимает
+# главный вопрос «а надо ли перезапускать SSH?».
+#
+# Для одного лишь authorized_keys перезапуск не обязателен: sshd читает файл на
+# каждой попытке входа. Поэтому честно говорим и то, и другое.
+_ssh_after_keys_change() {
+	local label="${1:-Ключи обновлены}"
+	if ! command -v sshd &>/dev/null; then
+		log_warn "$label, но sshd не установлен — вход по ключу не заработает"
+		return 1
+	fi
+	# Рестарт при невалидном конфиге добил бы работающий sshd. Поэтому сначала
+	# проверка, и только потом трогаем службу.
+	if ! sshd -t &>>"$LOG_FILE"; then
+		log_err "sshd_config не проходит sshd -t — SSH НЕ перезапускаю (текущий процесс жив)"
+		log_info "  проверьте: sshd -t  и  $SSHD_CONFIG_D/"
+		return 1
+	fi
+	if ! svc_is_active "$SSH_SERVICE"; then
+		log_warn "Служба SSH была НЕ запущена — именно поэтому вход не работал; запускаю"
+		svc_enable "$SSH_SERVICE" || true
+		if svc_start "$SSH_SERVICE" && svc_is_active "$SSH_SERVICE"; then
+			log_ok "SSH запущен ($SSH_SERVICE)"
+		else
+			# svc_start может отдать 0 и не поднять демон (так ведёт себя OpenRC
+			# в chroot) — поэтому проверяем факт, а не код возврата
+			log_err "SSH не запустился — диагностика: этап 5, пункт 8"
+			return 1
+		fi
+		return 0
+	fi
+	svc_daemon_reload
+	if svc_restart "$SSH_SERVICE"; then
+		log_ok "$label; SSH перезапущен ($SSH_SERVICE)"
+		hint "для одного authorized_keys перезапуск не обязателен — sshd читает файл на каждом входе"
+	else
+		log_warn "$label, но SSH не перезапустился — см. этап 5, пункт 8"
+		return 1
+	fi
+	return 0
+}
+
+# Права файла: GNU stat (-c) или BSD/busybox (-f). Тихий возврат пустой строки
+# лучше выдуманного значения — дальше мы это отдельно обрабатываем.
+_file_mode() {
+	stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+# Почему SSH не пускает — самый частый вопрос после установки ключа. Смотрит
+# обе стороны: что на сервере (sshd, порт, фаервол, права и читаемость ключей)
+# и что видит клиент. Ничего не меняет — только читает.
+_ssh_diagnose() {
+	echo ""
+	echo -e "${C_BOLD}▸ Проверка входа по SSH${C_RESET}"
+
+	# 1) sshd: конфиг и служба
+	if ! command -v sshd &>/dev/null; then
+		log_err "sshd не установлен"
+	elif sshd -t 2>&1 | tee -a "$LOG_FILE" | grep -q .; then
+		log_err "Конфиг sshd не проходит проверку (вывод выше)"
+	else
+		log_ok "Конфиг sshd валиден (sshd -t)"
+	fi
+	svc_is_active "$SSH_SERVICE" && log_ok "Служба SSH запущена ($SSH_SERVICE)" ||
+		log_err "Служба SSH НЕ запущена ($SSH_SERVICE) — это и даёт «Connection refused»"
+
+	# 2) порт: что в конфиге и что реально слушается
+	_ssh_port_refresh
+	_ssh_listen_ports
+	echo -e "  порт в конфиге: ${C_BOLD}$CURRENT_SSH_PORT${C_RESET}"
+	if [[ " $_seen_ports " == *" $CURRENT_SSH_PORT "* ]]; then
+		log_ok "sshd слушает $CURRENT_SSH_PORT"
+	else
+		log_err "sshd НЕ слушает $CURRENT_SSH_PORT (слушает: ${_seen_ports:-ничего})"
+	fi
+
+	# 3) фаервол: если он активен, а порта в нём нет — снаружи тишина
+	local fw
+	fw=$(_fw_cmd)
+	if [[ "$fw" == firewalld ]]; then
+		if firewall-cmd --state 2>/dev/null | grep -q running; then
+			firewall-cmd --list-ports 2>/dev/null | grep -q "$CURRENT_SSH_PORT/tcp" &&
+				log_ok "firewalld: порт $CURRENT_SSH_PORT открыт" ||
+				log_err "firewalld активен, но порт $CURRENT_SSH_PORT не открыт"
+		fi
+	elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+		ufw status 2>/dev/null | grep -qE "^$CURRENT_SSH_PORT/tcp" &&
+			log_ok "UFW: порт $CURRENT_SSH_PORT открыт" ||
+			log_err "UFW активен, но порт $CURRENT_SSH_PORT не разрешён"
+	else
+		log_info "Фаервол неактивен — порт ничего не режет"
+	fi
+
+	# 4) ключи: владелец, права и читаемость. sshd молча игнорирует
+	# authorized_keys, если владелец/права не те или строка битая.
+	local u _uid _g uh kf n_keys bad line_no l
+	while IFS=: read -r u _uid _g uh; do
+		kf="$uh/.ssh/authorized_keys"
+		[[ -f "$kf" ]] || continue
+		n_keys=$(grep -cvE '^[[:space:]]*(#|$)' "$kf" 2>/dev/null || echo 0)
+		if [[ "$(find "$kf" -maxdepth 0 -user "$u" 2>/dev/null)" != "$kf" ]]; then
+			log_err "$u: владелец $kf не $u — sshd такой ключ игнорирует"
+			log_info "  исправить: chown -R $u:$u $uh/.ssh && chmod 700 $uh/.ssh && chmod 600 $kf"
+		fi
+		local mode
+		mode=$(_file_mode "$kf")
+		case "$mode" in
+		600 | 640 | 644) ;;
+		"") ;;
+		*) log_warn "$u: права $kf = $mode (обычно 600)" ;;
+		esac
+		bad=0
+		line_no=0
+		while IFS= read -r l; do
+			line_no=$((line_no + 1))
+			[[ -z "$l" || "$l" == \#* ]] && continue
+			printf '%s\n' "$l" | ssh-keygen -l -f - &>/dev/null || {
+				bad=$((bad + 1))
+				log_warn "$u: строка $line_no в $kf не читается как ключ (обрезана?)"
+			}
+		done <"$kf"
+		[[ $bad -eq 0 ]] && log_ok "$u: ключей $n_keys, все читаются ($kf)"
+	done < <(get_regular_users --with-root)
+
+	# 5) что видит клиент и что с этим делать
+	echo ""
+	echo -e "  ${C_DIM}Со стороны клиента:${C_RESET}"
+	hint "«Connection refused» — на этом порту никто не слушает: не тот порт или sshd не запущен"
+	hint "«Permission denied (publickey)» — ключ не приняли: смотрите владельца и права authorized_keys"
+	hint "«SSH_AUTH_SOCK is not set» — клиент хочет ssh-agent, а агента нет; выберите ключ файлом:"
+	hint "  ssh -i ~/.ssh/id_ed25519 -p $CURRENT_SSH_PORT <пользователь>@<адрес>"
+	echo ""
+	read -rp "  Enter..." _
+}
+
 stage_ssh_config() {
 	stage_banner "$ICON_KEY" "5" "Настройка SSH"
 
@@ -1596,10 +1998,18 @@ stage_ssh_config() {
 	local psp
 	psp=$(_sshd_option "$sc" persourcepenalties enabled)
 	if [[ "$psp" == disabled ]]; then
-		echo "  7) Rate-limit атакующих (PerSourcePenalties): ${C_DIM}нет (OpenSSH < 9.8)${C_RESET}"
+		echo -e "  7) Rate-limit атакующих (PerSourcePenalties): ${C_DIM}нет (OpenSSH < 9.8)${C_RESET}"
 	else
-		echo "  7) Rate-limit атакующих (PerSourcePenalties): ${C_GREEN}встроенный${C_RESET}"
+		echo -e "  7) Rate-limit атакующих (PerSourcePenalties): ${C_GREEN}встроенный${C_RESET}"
 	fi
+	echo "  8) Почему не пускает SSH (диагностика)"
+	echo ""
+	echo -e "  ${C_DIM}Что это значит:${C_RESET}"
+	hint "парольный вход yes — к любому пользователю можно подобрать пароль по SSH"
+	hint "prohibit-password у root — root пускают только по SSH-ключу, пароль не спросят"
+	hint "вход root no — root по SSH не входит совсем (тогда админ — обычный пользователь)"
+	hint "MaxAuthTries — сколько попыток пароля даётся за одно соединение (6 — норма)"
+	hint "пустые пароли yes — учётка без пароля входит без пароля"
 	echo "  S) Пропустить"
 	echo ""
 	read -rp "  ${ICON_ARROW} " sa
@@ -1632,7 +2042,10 @@ stage_ssh_config() {
 		_wanted_close_port=$old_port
 		;;
 	2)
-		echo "  1) yes  2) no"
+		echo -e "  ${C_BOLD}Вход по паролю (PasswordAuthentication):${C_RESET}"
+		hint "1) yes — можно входить по паролю; удобно, но пароли подбирают боты (нужен этап 9)"
+		hint "2) no  — только SSH-ключ; безопаснее, но сначала проверьте, что ключ работает"
+		echo ""
 		read -rp "  ${ICON_ARROW} " c
 		[[ "$c" == "2" ]] && {
 			# без KbdInteractive пароль всё равно принимается через PAM
@@ -1646,7 +2059,11 @@ stage_ssh_config() {
 		}
 		;;
 	3)
-		echo "  1) prohibit-password (рекомендуется)  2) no  3) yes (небезопасно)"
+		echo -e "  ${C_BOLD}Как root может входить:${C_RESET}"
+		hint "1) prohibit-password — по ключу можно, по паролю нельзя (так и надо)   ← рекомендуется"
+		hint "2) no                — root по SSH не входит совсем; нужен свой админ с ключом"
+		hint "3) yes               — пускает root и по паролю: открытая дверь, только на время отладки"
+		echo ""
 		read -rp "  ${ICON_ARROW} " c
 		case "$c" in
 		1 | "") _ssh_apply "PermitRootLogin → prohibit-password" "PermitRootLogin=prohibit-password" || return 1 ;;
@@ -1662,6 +2079,8 @@ stage_ssh_config() {
 		esac
 		;;
 	4)
+		echo -e "  ${C_BOLD}Макс. попыток (MaxAuthTries):${C_RESET}"
+		hint "сколько раз можно ошибиться с паролем в одном соединении; 3-6 — обычно достаточно"
 		read -rp "  Макс. попыток (1-10): " nm
 		[[ "$nm" =~ ^[0-9]+$ && $nm -ge 1 && $nm -le 10 ]] || {
 			log_err "1-10"
@@ -1670,7 +2089,10 @@ stage_ssh_config() {
 		_ssh_apply "MaxAuthTries → $nm" "MaxAuthTries=$nm" || return 1
 		;;
 	5)
-		echo "  1) no (рекомендуется)  2) yes"
+		echo -e "  ${C_BOLD}Пустые пароли (PermitEmptyPasswords):${C_RESET}"
+		hint "1) no  — учётка без пароля не войдёт (норма)"
+		hint "2) yes — пустой пароль пускает в систему: небезопасно"
+		echo ""
 		read -rp "  ${ICON_ARROW} " c
 		[[ "$c" == "1" ]] && {
 			_ssh_apply "Пустые пароли запрещены" "PermitEmptyPasswords=no" || return 1
@@ -1696,17 +2118,18 @@ stage_ssh_config() {
 			log_warn "OpenSSH < 9.8: PerSourcePenalties недоступны"
 			log_info "Защита от брутфорса — этап 9 (Fail2Ban/CrowdSec)"
 		else
-			echo ""
 			echo -e "  ${C_DIM}Условия: authfail, noauth, invaliduser, crash; далее минуты бана и потолок${C_RESET}"
 			echo "  Текущая политика: $(_sshd_option "$sc" persourcepenalties '(по умолчанию)')"
 			echo -e "  ${C_DIM}Это встроенный rate-limit: источник с ошибками входа временно
   перестаёт получать соединения. Дополняет Fail2Ban (этап 9), не заменяет.${C_RESET}"
+			echo ""
 			echo ""
 			if confirm "Включить PerSourcePenalties явно?"; then
 				_ssh_apply "PerSourcePenalties включены" "PerSourcePenalties=yes" || return 1
 			fi
 		fi
 		;;
+	8) _ssh_diagnose ;;
 	*) log_info "Пропущено" ;;
 	esac
 
@@ -1811,7 +2234,7 @@ EOF
 
 	echo ""
 	echo "  SSH-ключ для $sfu:"
-	echo "  1) Вставить    2) Скопировать    3) Пропустить"
+	echo "  1) Вставить    2) Скопировать    S) Пропустить"
 	read -rp "  ${ICON_ARROW} " ka
 	case "$ka" in
 	1)
@@ -1831,7 +2254,7 @@ EOF
 			echo "    $si) $user"
 			sus+=("$user")
 			si=$((si + 1))
-		done < <(get_regular_users)
+		done < <(get_regular_users --with-root)
 		[[ ${#sus[@]} -eq 0 ]] && { log_warn "Нет ключей"; } || {
 			read -rp "  Номер: " sn
 			if [[ "$sn" =~ ^[0-9]+$ && $sn -ge 1 && $sn -le ${#sus[@]} ]]; then
@@ -1866,7 +2289,7 @@ _firewalld_menu() {
 			return 1
 		}
 	}
-	systemctl enable --now firewalld 2>/dev/null
+	svc_enable_now firewalld
 
 	_ssh_port_refresh
 	local sp=$CURRENT_SSH_PORT
@@ -1907,12 +2330,24 @@ _firewalld_menu() {
 			read -rp "  Порт/протокол (напр. 8080/tcp): " pp
 			firewall-cmd --permanent --remove-port="$pp" 2>/dev/null && log_ok "$pp удалён" || log_err "Не удалось"
 			;;
-		5) systemctl enable --now firewalld && log_ok "firewalld включён" ;;
+			5)
+			svc_enable_now firewalld
+			# та же ловушка, что и с ufw enable: сообщать об успехе только по факту
+			if firewall-cmd --state 2>/dev/null | grep -q running; then
+				log_ok "firewalld включён"
+			else
+				log_err "firewalld НЕ запустился — проверьте: firewall-cmd --state"
+			fi
+			;;
 		6)
 			echo -e "  ${C_YELLOW}Сервер останется без фаервола!${C_RESET}"
 			confirm "Отключить firewalld?" && {
-				systemctl disable --now firewalld
-				log_ok "firewalld отключён"
+				svc_disable_now firewalld
+				if firewall-cmd --state 2>/dev/null | grep -q running; then
+					log_warn "firewalld всё ещё запущен"
+				else
+					log_ok "firewalld отключён"
+				fi
 			}
 			;;
 		7)
@@ -1956,6 +2391,9 @@ stage_ufw() {
 		_firewalld_menu
 		return $?
 	}
+	# UFW на Alpine живёт только вместе с init-скриптом ufw-openrc:
+	# без него правила запишутся, но не всплывут после перезагрузки.
+	[[ "$PKG_MGR" == apk ]] && _ensure_base_tools
 	stage_banner "$ICON_FIRE" "7" "Настройка UFW"
 
 	if ! command -v ufw &>/dev/null; then
@@ -1966,6 +2404,7 @@ stage_ufw() {
 	else
 		log_info "UFW уже установлен"
 	fi
+	[[ "$PKG_MGR" == apk ]] && { pkg_install_retry "ufw-openrc" || log_warn "ufw-openrc не установлен — ufw не поднимется сам"; }
 
 	backup_file "/etc/default/ufw" "stage7_ufw"
 	backup_file "/etc/ufw/ufw.conf" "stage7_ufw"
@@ -2046,12 +2485,28 @@ stage_ufw() {
 			echo -e "  ${C_YELLOW}Убедитесь, что SSH-порт ($sp) открыт ПЕРЕД включением UFW!${C_RESET}"
 			if confirm "Включить UFW?"; then
 				ufw --force enable
-				log_ok "UFW включён"
+				# ufw enable только пишет /etc/ufw/ufw.conf; автозапуск — дело init
+				[[ "$PKG_MGR" == apk ]] && svc_enable ufw
+				# "UFW включён" — только если он действительно активен: enable может
+				# отработать наполовину (нет прав на netfilter, битые правила) и при этом
+				# тихо оставить ENABLED=no — обещать защиту в этом случае нельзя
+				if ufw status 2>/dev/null | grep -q "Status: active"; then
+					log_ok "UFW включён"
+				else
+					log_err "UFW НЕ включился — проверьте: ufw status"
+				fi
 			fi
 			;;
 		6)
 			ufw disable
-			log_ok "UFW отключён"
+			[[ "$PKG_MGR" == apk ]] && svc_disable ufw
+			# disable переворачивает ENABLED в ufw.conf; если он остался yes —
+			# фаервол вернётся после перезагрузки, о чём пользователь должен знать
+			if grep -qE '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+				log_warn "UFW всё ещё включён (ENABLED=yes в /etc/ufw/ufw.conf)"
+			else
+				log_ok "UFW отключён"
+			fi
 			;;
 		7) confirm "Сбросить ВСЕ правила?" && {
 			ufw --force reset
@@ -2083,6 +2538,14 @@ stage_ufw() {
 stage_autoupdate() {
 	stage_banner "$ICON_GEAR" "8" "Автообновления безопасности"
 
+	# Alpine: unattended-upgrades/dnf-automatic не существует — безопасность
+	# приезжает вместе с apk upgrade, а расписание делается периодическим cron.
+	if [[ "$PKG_MGR" == apk ]]; then
+		_stage_autoupdate_apk
+		update_stage_status "stage8_autoupdate" "completed"
+		return 0
+	fi
+
 	case "$PKG_MGR" in
 	apt)
 		backup_file "/etc/apt/apt.conf.d/20auto-upgrades" "stage8_autoupdate"
@@ -2112,8 +2575,8 @@ reboot = when-needed
 [emitters]
 emit_via = motd
 EOF
-		systemctl enable dnf-automatic.timer 2>/dev/null || true
-		systemctl start dnf-automatic.timer 2>/dev/null || true
+		svc_enable dnf-automatic.timer || true
+		svc_start dnf-automatic.timer || true
 		;;
 	esac
 
@@ -2141,8 +2604,8 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF
 		fi
-		systemctl enable apt-daily-upgrade.timer 2>/dev/null || true
-		systemctl start apt-daily-upgrade.timer 2>/dev/null || true
+		svc_enable apt-daily-upgrade.timer || true
+		svc_start apt-daily-upgrade.timer || true
 		;;
 	dnf | yum)
 		if [[ -n "$reboot_time" ]]; then
@@ -2162,9 +2625,9 @@ Description=Reboot system
 Type=oneshot
 ExecStart=/usr/sbin/reboot
 EOF
-			systemctl daemon-reload
-			systemctl enable reboot-after-updates.timer 2>/dev/null || true
-			systemctl start reboot-after-updates.timer 2>/dev/null || true
+			svc_daemon_reload
+			svc_enable reboot-after-updates.timer || true
+			svc_start reboot-after-updates.timer || true
 			log_info "Авто-перезагрузка: ежедневно в $reboot_time"
 		fi
 		;;
@@ -2174,28 +2637,212 @@ EOF
 	update_stage_status "stage8_autoupdate" "completed"
 }
 
+# Alpine: своего unattended-upgrades нет. Кладём ежедневный скрипт в
+# /etc/periodic/daily (его запускает busybox crond / cronie) и включаем cron.
+_stage_autoupdate_apk() {
+	local script="/etc/periodic/daily/4script-security-update"
+	backup_file "$script" "stage8_autoupdate"
+
+	echo ""
+	echo -e "  ${C_DIM}Обновление через apk: сначала индексы, затем пакеты. Перезагрузку
+  автоматика не делает — только сообщает в лог.${C_RESET}"
+	echo ""
+	if ! confirm "Создать ежедневное обновление (/etc/periodic/daily)?"; then
+		log_info "Пропущено"
+		return 0
+	fi
+
+	cat >"$script" <<'EOF'
+#!/bin/sh
+# 4script: ежедневное обновление безопасности Alpine
+# Лог: /var/log/4script-autoupdate.log
+LOG=/var/log/4script-autoupdate.log
+{
+	echo "=== $(date -Iseconds) 4script: apk update && apk upgrade"
+	apk update && apk -U upgrade --available
+} >>"$LOG" 2>&1
+EOF
+	chmod 755 "$script"
+
+	# Cron на Alpine есть не всегда: busybox crond входит в базовую систему,
+	# но если стоит cronie — включаем его. Хотя бы один нужен.
+	if svc_exists crond; then
+		svc_enable crond || true
+		svc_start crond || true
+		svc_is_active crond && log_ok "cron запущен (busybox crond)" || log_warn "crond не запустился"
+	elif svc_exists cronie; then
+		svc_enable cronie || true
+		svc_start cronie || true
+		svc_is_active cronie && log_ok "cron запущен (cronie)" || log_warn "cronie не запустился"
+	else
+		log_warn "На Alpine нет crond/cronie — скрипт $script не будет запускаться сам"
+		_pkg_hint_apk_cron
+	fi
+	log_ok "Ежедневное обновление установлено: $script"
+	log_info "Лог обновлений: /var/log/4script-autoupdate.log"
+}
+
+# Подсказка о том, что cron надо просто поставить — с точным именем пакета
+_pkg_hint_apk_cron() {
+	log_info "Установить: apk add busybox-openrc  (или apk add cronie cronie-openrc)"
+}
+
 # ═══════════════════════════════════════════════════════════════════
 #  ЭТАП 9: ЗАЩИТА ОТ БРУТФОРСА (CrowdSec / Fail2Ban)
 # ═══════════════════════════════════════════════════════════════════
 
+# Что уже стоит из защиты от брутфорса. Печатает «crowdsec», «fail2ban» или оба.
+# Считаем по бинарю, а не по активности службы: человек мог поставить защиту и
+# не запустить её — про это честнее сказать отдельно.
+_intrusion_state() {
+	local out=()
+	command -v cscli &>/dev/null && out+=(crowdsec)
+	command -v fail2ban-client &>/dev/null && out+=(fail2ban)
+	printf '%s' "${out[*]:-}"
+}
+
+# Удаление пакета: один вызов на все менеджеры, чтобы не плодить case по месту.
+pkg_remove() {
+	case "$PKG_MGR" in
+	apt) apt-get remove -y --purge "$@" &>/dev/null ;;
+	dnf | yum) $PKG_MGR remove -y "$@" &>/dev/null ;;
+	apk) apk del -q "$@" &>/dev/null ;;
+	esac
+}
+
+# Убрать Fail2Ban: сначала служба (иначе останутся живые баны и процессы),
+# потом пакет. jail.local и его бэкапы не трогаем — там может быть своя правка.
+_remove_fail2ban() {
+	local dirty=false
+	command -v fail2ban-client &>/dev/null || svc_exists fail2ban || {
+		log_info "Fail2Ban не установлен"
+		return 0
+	}
+	log_warn "Удаление Fail2Ban: правила банов на сервере снимутся, защита от брутфорса останется только у SSH"
+	confirm "Удалить Fail2Ban?" || {
+		log_info "Отменено"
+		return 1
+	}
+	svc_disable_now fail2ban || true
+	# на Alpine init-скрипт лежит в отдельном пакете
+	if [[ "$PKG_MGR" == apk ]]; then
+		pkg_remove fail2ban fail2ban-openrc || dirty=true
+	else
+		pkg_remove fail2ban || dirty=true
+	fi
+	$dirty && log_warn "Пакет удалён не полностью — проверьте вручную" ||
+		log_ok "Fail2Ban удалён (конфиг и бэкапы остались в /etc/fail2ban)"
+}
+
+# Убрать CrowdSec: два сервиса (движок и бонсер), затем пакеты.
+_remove_crowdsec() {
+	command -v cscli &>/dev/null || svc_exists crowdsec || {
+		log_info "CrowdSec не установлен"
+		return 0
+	}
+	log_warn "Удаление CrowdSec: движок и бонсер будут остановлены, решения о банах — удалены"
+	confirm "Удалить CrowdSec?" || {
+		log_info "Отменено"
+		return 1
+	}
+	local s
+	for s in crowdsec-firewall-bouncer crowdsec; do
+		svc_disable_now "$s" || true
+	done
+	local dirty=false
+	pkg_remove crowdsec crowdsec-firewall-bouncer-iptables crowdsec-firewall-bouncer nftables || dirty=true
+	$dirty && log_warn "Часть пакетов CrowdSec удалить не удалось (ставился своим скриптом?)" ||
+		log_ok "CrowdSec удалён (данные остались в /var/lib/crowdsec)"
+	# каталог со сценариями чистим только по отдельному подтверждению
+	if [[ -d /etc/crowdsec ]]; then
+		confirm "Удалить ещё и конфиги /etc/crowdsec?" && rm -rf /etc/crowdsec && log_ok "/etc/crowdsec удалён"
+	fi
+}
+
 stage_intrusion() {
 	stage_banner "$ICON_SHIELD" "9" "Защита от брутфорса"
 
-	# Проверяем что уже установлено
-	local has_cs=false has_f2b=false
-	command -v cscli &>/dev/null && has_cs=true
-	systemctl is-active --quiet fail2ban 2>/dev/null && has_f2b=true
+	# Что уже стоит: даём выбрать — оставить, заменить или убрать вовсе,
+	# а не просто выходим с «уже установлено», как было раньше.
+	local inst
+	inst=$(_intrusion_state)
+	if [[ -n "$inst" ]]; then
+		echo -e "${C_BOLD}▸ Уже установлено:${C_RESET} $inst"
+		svc_is_active crowdsec && echo -e "  ${C_GREEN}●${C_RESET} CrowdSec запущен"
+		svc_is_active fail2ban && echo -e "  ${C_GREEN}●${C_RESET} Fail2Ban запущен"
+		echo ""
+		echo "  1) Оставить как есть"
+		echo "  2) Заменить на другую"
+		echo "  3) Удалить"
+		echo "  S) Назад"
+		echo ""
+		read -rp "  ${ICON_ARROW} " ia
 
-	if $has_cs; then log_info "CrowdSec уже установлен"; fi
-	if $has_f2b; then log_info "Fail2Ban уже установлен"; fi
-	if $has_cs || $has_f2b; then
-		update_stage_status "stage9_intrusion" "completed"
-		return 0
+		case "$ia" in
+		1)
+			log_info "Оставлено как есть"
+			update_stage_status "stage9_intrusion" "completed"
+			return 0
+			;;
+		2)
+			# убираем то, что стоит, и идём к обычному выбору установки ниже
+			[[ "$inst" == *crowdsec* ]] && _remove_crowdsec
+			[[ "$inst" == *fail2ban* ]] && _remove_fail2ban
+			inst=$(_intrusion_state)
+			[[ -n "$inst" ]] && {
+				log_warn "Удалить не удалось — старая защита осталась: $inst"
+				return 1
+			}
+			log_info "Старая защита удалена — выбираем новую"
+			;;
+		3)
+			local which="$inst"
+			if [[ "$inst" == *crowdsec*fail2ban* || "$inst" == *fail2ban*crowdsec* ]]; then
+				echo ""
+				echo "  1) CrowdSec   2) Fail2Ban   3) обе"
+				read -rp "  ${ICON_ARROW} " w
+				case "$w" in
+				1) which=crowdsec ;;
+				2) which=fail2ban ;;
+				3) which="$inst" ;;
+				*) which="" ;;
+				esac
+			fi
+			[[ "$which" == *crowdsec* ]] && _remove_crowdsec
+			[[ "$which" == *fail2ban* ]] && _remove_fail2ban
+			log_warn "Брутфорс по SSH остаётся прикрыт только встроенным PerSourcePenalties (OpenSSH 9.8+)"
+			update_stage_status "stage9_intrusion" "skipped"
+			return 0
+			;;
+		*)
+			log_info "Пропущено"
+			return 0
+			;;
+		esac
 	fi
 
 	echo ""
 	echo -e "  ${C_BOLD}Выберите систему защиты:${C_RESET}"
 	echo ""
+	# CrowdSec в репозиториях Alpine нет (проверено: apk search -x crowdsec пусто).
+	# Его install-скрипт рассчитан на apt/dnf, поэтому предлагать его нечестно.
+	if [[ "$PKG_MGR" == apk ]]; then
+		echo -e "  ${C_DIM}CrowdSec в репозиториях Alpine недоступен — доступен Fail2Ban${C_RESET}"
+		echo ""
+		echo -e "  ${C_BOLD}1)${C_RESET} Fail2Ban  ${C_DIM}— локальная, простая, легковесная${C_RESET}"
+		echo ""
+		read -rp "  ${ICON_ARROW} " choice
+		case "$choice" in
+		1) _install_fail2ban ;;
+		*)
+			log_info "Пропущено"
+			update_stage_status "stage9_intrusion" "skipped"
+			return 0
+			;;
+		esac
+		update_stage_status "stage9_intrusion" "completed"
+		return 0
+	fi
 	echo -e "  ${C_BOLD}1)${C_RESET} CrowdSec  ${C_DIM}— облачная, умная, требует интернет, сложнее${C_RESET}"
 	echo -e "  ${C_BOLD}2)${C_RESET} Fail2Ban  ${C_DIM}— локальная, простая, не требует интернета, легковесная${C_RESET}"
 	echo ""
@@ -2264,9 +2911,9 @@ _install_crowdsec() {
 	if [[ "$(_fw_cmd)" == firewalld ]]; then
 		log_warn "firewalld: iptables-бонсер CrowdSec конфликтует с firewalld"
 		log_warn "Ставлю CrowdSec-движок (детект), а банить будет Fail2Ban"
-		systemctl enable --now crowdsec 2>/dev/null || true
+		svc_enable_now crowdsec
 		sleep 2
-		systemctl is-active --quiet crowdsec && log_ok "CrowdSec запущен (без бонсера)" || log_warn "CrowdSec не запустился"
+		svc_is_active crowdsec && log_ok "CrowdSec запущен (без бонсера)" || log_warn "CrowdSec не запустился"
 		_crowdsec_collections
 		_install_fail2ban
 		cscli version 2>/dev/null || true
@@ -2275,12 +2922,12 @@ _install_crowdsec() {
 
 	pkg_install_retry "crowdsec-firewall-bouncer-iptables" || log_warn "Без bouncer'а — установите вручную"
 
-	systemctl enable crowdsec 2>/dev/null || true
-	systemctl start crowdsec 2>/dev/null || true
-	systemctl enable crowdsec-firewall-bouncer 2>/dev/null || true
-	systemctl start crowdsec-firewall-bouncer 2>/dev/null || true
+	svc_enable crowdsec || true
+	svc_start crowdsec || true
+	svc_enable crowdsec-firewall-bouncer || true
+	svc_start crowdsec-firewall-bouncer || true
 	sleep 2
-	systemctl is-active --quiet crowdsec && log_ok "CrowdSec запущен" || log_warn "CrowdSec не запустился"
+	svc_is_active crowdsec && log_ok "CrowdSec запущен" || log_warn "CrowdSec не запустился"
 	_crowdsec_collections
 	cscli version 2>/dev/null || true
 }
@@ -2294,7 +2941,7 @@ _crowdsec_collections() {
 	fi
 	log_info "CrowdSec: ставлю коллекцию crowdsecurity/sshd..."
 	if cscli collections install crowdsecurity/sshd &>>"$LOG_FILE"; then
-		systemctl reload crowdsec 2>/dev/null || systemctl restart crowdsec 2>/dev/null || true
+		{ svc_reload crowdsec || svc_restart crowdsec; } || true
 		log_ok "CrowdSec: коллекция crowdsecurity/sshd установлена"
 	else
 		log_warn "Не удалось поставить crowdsecurity/sshd (нет сети?) — вручную: cscli collections install crowdsecurity/sshd"
@@ -2323,6 +2970,37 @@ _install_fail2ban() {
 	# Если нет ни того, ни другого — jail не стартует и падает весь сервис,
 	# поэтому лучше честно отключить jail, чем оставить молча мёртвый fail2ban.
 	local sshd_jail=""
+	if [[ "$PKG_MGR" == apk ]]; then
+		# На Alpine нет journald: sshd пишет туда, куда его направит syslog.
+		# Fail2Ban читает файл, поэтому нужен живой syslog-демон (busybox syslogd
+		# штатно пишет в /var/log/messages) и путь именно к нему.
+		# init-скрипт syslog даёт только busybox-openrc — без него демон не поднять.
+		if ! svc_exists syslog && ! svc_exists rsyslog; then
+			pkg_install_retry "busybox-openrc" || true
+		fi
+		local slog=""
+		svc_exists syslog && slog=syslog
+		svc_exists rsyslog && slog=rsyslog
+		if [[ -n "$slog" ]] && ! svc_is_active "$slog"; then
+			svc_enable "$slog" || true
+			svc_start "$slog" || true
+			sleep 1
+		fi
+		if [[ -e /var/log/messages ]] || svc_is_active "${slog:-syslog}"; then
+			sshd_jail="enabled = true
+port = $sp
+logpath = /var/log/messages
+backend = polling
+maxretry = 3
+bantime = 24h"
+			log_info "Alpine: Fail2Ban читает /var/log/messages (busybox syslogd)"
+			# без syslogd файла не будет и jail тихо не сработает
+			[[ -e /var/log/messages ]] || log_warn "Проверьте: rc-service syslog status и /var/log/messages"
+		else
+			log_warn "Нет syslog-демона и нет /var/log/messages — jail SSH отключён"
+			log_warn "  включить: apk add busybox-openrc && rc-update add syslog default && rc-service syslog start"
+		fi
+	else
 	local has_journal=false
 	dpkg -s python3-systemd &>/dev/null 2>&1 || rpm -q python3-systemd &>/dev/null 2>&1 || pkg_install_retry "python3-systemd" || true
 	if dpkg -s python3-systemd &>/dev/null 2>&1 || rpm -q python3-systemd &>/dev/null 2>&1; then
@@ -2346,6 +3024,7 @@ bantime = 24h"
 		log_warn "Нет python3-systemd и нет /var/log/auth.log — jail SSH отключён"
 		log_warn "  включить: apt-get install python3-systemd  (или rsyslog)"
 	fi
+	fi
 
 	{
 		cat <<EOF
@@ -2361,17 +3040,17 @@ EOF
 		[[ -n "$sshd_jail" ]] && echo "$sshd_jail"
 	} >"$f2b_jail"
 
-	systemctl enable fail2ban 2>/dev/null || true
-	systemctl restart fail2ban 2>/dev/null || true
+	svc_enable fail2ban || true
+	svc_restart fail2ban || true
 	sleep 2
-	if systemctl is-active --quiet fail2ban; then
+	if svc_is_active fail2ban; then
 		if [[ -n "$sshd_jail" ]]; then
 			log_ok "Fail2Ban запущен (SSH: порт $sp, 3 попытки → бан 24ч)"
 		else
 			log_warn "Fail2Ban запущен, но SSH не защищён — см. предупреждение выше"
 		fi
 	else
-		log_warn "Fail2Ban не запустился: systemctl status fail2ban"
+		log_warn "Fail2Ban не запустился: systemctl status fail2ban / rc-service fail2ban status"
 	fi
 }
 
@@ -2383,11 +3062,15 @@ EOF
 # Прямая запись в файл на resolved-системах бесполезна: он симлинк на stub,
 # а перегенерация затрёт ручные nameserver при следующем boot.
 _dns_backend() {
-	if command -v resolvectl &>/dev/null && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+	if $HAS_SYSTEMD && command -v resolvectl &>/dev/null && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
 		echo resolved
 	elif command -v netplan &>/dev/null; then
 		# только бинарь: каталог /etc/netplan есть и там, где netplan не используется
 		echo netplan
+	elif [[ "$PKG_MGR" == apk ]]; then
+		# Alpine: резолвер — это либо /etc/resolv.conf напрямую, либо
+		# openresolv, который переписывает тот же файл из /etc/resolvconf.conf
+		if command -v resolvconf &>/dev/null; then echo resolvconf; else echo file; fi
 	elif [[ -L /etc/resolv.conf ]]; then
 		echo symlink
 	else
@@ -2425,6 +3108,16 @@ _dns_apply() {
 		log_warn "DNS управляется netplan — правка /etc/resolv.conf будет затёрта при boot"
 		log_info "Задайте nameservers в /etc/netplan/*.yaml и выполните: netplan apply"
 		;;
+	resolvconf)
+		# openresolv: правки в /etc/resolv.conf он затирает, поэтому пишем его конфиг
+		backup_file "/etc/resolvconf.conf" "stage10_dns"
+		{
+			echo "# 4script"
+			echo "name_servers=\"$servers\""
+		} >/etc/resolvconf.conf
+		resolvconf -u 2>/dev/null || log_warn "resolvconf -u не сработал — проверьте /etc/resolv.conf"
+		log_ok "DNS через openresolv: $servers"
+		;;
 	*)
 		backup_file "/etc/resolv.conf" "stage10_dns"
 		{
@@ -2449,7 +3142,7 @@ stage_dns() {
 	echo -e "  ${C_DIM}Управление: $b${C_RESET}"
 
 	echo ""
-	echo "  1) Заменить    3) Пропустить"
+	echo "  1) Заменить    S) Пропустить"
 	read -rp "  ${ICON_ARROW} " da
 	case "$da" in
 	1)
@@ -2504,6 +3197,13 @@ stage_fish() {
 stage_timezone() {
 	stage_banner "🕐" "12" "Часовой пояс и синхронизация времени"
 
+	# Alpine: timedatectl отсутствует (нет systemd) — правим /etc/localtime
+	# и /etc/timezone напрямую, а время синхронизирует chrony.
+	if ! command -v timedatectl &>/dev/null; then
+		_stage_timezone_no_systemd
+		return $?
+	fi
+
 	# Текущее состояние
 	echo -e "${C_BOLD}Текущее:${C_RESET}"
 	echo "  Часовой пояс: $(timedatectl show --property=Timezone --value 2>/dev/null || echo 'не определён')"
@@ -2547,6 +3247,66 @@ stage_timezone() {
 	esac
 }
 
+# Нет systemd (Alpine): /etc/localtime — симлинк на файл зоны, /etc/timezone —
+# текстовый файл, время синхронизирует chronyd или openntpd через init.
+_stage_timezone_no_systemd() {
+	echo -e "${C_BOLD}Текущее:${C_RESET}"
+	local cur_tz="не определён"
+	[[ -L /etc/localtime ]] && cur_tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+	[[ -f /etc/timezone ]] && cur_tz=$(< /etc/timezone)
+	echo "  Часовой пояс: $cur_tz"
+	local ntp_svc=""
+	for s in chronyd ntpd; do
+		svc_is_active "$s" && ntp_svc="$s" && break
+	done
+	echo "  NTP сервис:   ${ntp_svc:-не запущен}"
+	echo "  Время:        $(date '+%Y-%m-%d %H:%M:%S %Z')"
+	echo ""
+
+	echo "  1) Сменить часовой пояс"
+	echo "  2) Установить и включить chrony"
+	echo "  3) И то и другое"
+	echo "  S) Пропустить"
+	read -rp "  ${ICON_ARROW} " choice
+
+	case "$choice" in
+	1 | 2 | 3)
+		if [[ "$choice" == 1 || "$choice" == 3 ]]; then
+			echo ""
+			echo "  Популярные зоны:"
+			echo "    Europe/Moscow      Europe/London      Europe/Berlin"
+			echo "    America/New_York   America/Chicago    America/Los_Angeles"
+			echo "    Asia/Tokyo         Asia/Singapore     Asia/Dubai"
+			echo ""
+			read -rp "  Часовой пояс: " tz
+			if [[ -n "$tz" && -f "/usr/share/zoneinfo/$tz" ]]; then
+				# симлинк + копия файла: /etc/timezone читают не все, busybox date — читает
+				ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+				printf '%s\n' "$tz" >/etc/timezone
+				log_ok "Часовой пояс → $tz"
+			else
+				log_err "Неверный часовой пояс: $tz (нет /usr/share/zoneinfo/$tz)"
+				log_info "  Список зон: apk add tzdata && ls /usr/share/zoneinfo"
+			fi
+		fi
+		if [[ "$choice" == 2 || "$choice" == 3 ]]; then
+			pkg_install_retry "chrony" || log_err "Пакет chrony недоступен"
+			if svc_exists chronyd; then
+				svc_enable chronyd || true
+				svc_restart chronyd || svc_start chronyd || true
+				svc_is_active chronyd && log_ok "chrony запущен (сверка времени)" || log_warn "chronyd не запустился"
+			fi
+		fi
+		update_stage_status "stage12_timezone" "completed"
+		;;
+	*)
+		log_info "Пропущено"
+		update_stage_status "stage12_timezone" "skipped"
+		;;
+	esac
+	return 0
+}
+
 # ═══════════════════════════════════════════════════════════════════
 #  ЭТАП 13: LYNIS — АУДИТ БЕЗОПАСНОСТИ
 # ═══════════════════════════════════════════════════════════════════
@@ -2555,6 +3315,14 @@ stage_lynis() {
 	stage_banner "🔍" "13" "Аудит безопасности (Lynis)"
 
 	if ! command -v lynis &>/dev/null; then
+		# пакета lynis в репозиториях Alpine нет — не притворяемся, что поставили
+		if [[ "$PKG_MGR" == apk ]]; then
+			log_warn "Lynis нет в репозиториях Alpine"
+			log_info "  Альтернатива: собственный этап 17 (аудит портов, SUID, LSM) или docker-образ cisofy/lynis"
+			log_info "  Вручную: docker run --rm -v /:/host cisofy/lynis"
+			update_stage_status "stage13_lynis" "skipped"
+			return 0
+		fi
 		pkg_install_retry "lynis" || {
 			update_stage_status "stage13_lynis" "failed"
 			return 1
@@ -2617,6 +3385,9 @@ stage_disk() {
 
 	echo -e "${C_BOLD}▸ Использование диска:${C_RESET}"
 	echo ""
+	# busybox df не знает --type, busybox sort не знает -h: без GNU-версий
+	# команды не падают, но и не делают того, что нужно
+	[[ "$PKG_MGR" == apk ]] && _ensure_base_tools
 	df -h --type=ext4 --type=xfs --type=btrfs 2>/dev/null || df -h 2>/dev/null | head -20
 	echo ""
 
@@ -2773,6 +3544,9 @@ _sysctl_conf() { printf '%s' "/etc/sysctl.d/99-seq-vps.conf"; }
 stage_sysctl() {
 	stage_banner "🧩" "16" "Харденинг ядра (sysctl)"
 
+	# sysctl -p по файлу работает в т.ч. с busybox; на Alpine /etc/sysctl.d
+	# подхватывает init-скрипт sysctl при загрузке.
+
 	echo -e "${C_BOLD}▸ Рекомендуемые параметры:${C_RESET}"
 	local def name want why cur mark
 	local to_apply=()
@@ -2784,9 +3558,13 @@ stage_sysctl() {
 			continue
 		fi
 		if [[ "$cur" == "$want" ]]; then
-			printf '  ${C_GREEN}%s${C_RESET} %-40s ${C_GREEN}%s${C_RESET} %s\n' "$ICON_OK" "$name" "$cur" "$why"
+			# цвета передаём аргументами и печатаем через %b: в single-quoted формате
+			# printf подстановки вида ${C_GREEN} остались бы текстом на экране
+			printf '  %b%s%b %-40s %b%s%b %s\n' \
+				"$C_GREEN" "$ICON_OK" "$C_RESET" "$name" "$C_GREEN" "$cur" "$C_RESET" "$why"
 		else
-			printf '  ${C_YELLOW}%s${C_RESET} %-40s ${C_YELLOW}%s${C_RESET} → ${C_GREEN}%s${C_RESET}\n' "$ICON_WARN" "$name" "$cur" "$want"
+			printf '  %b%s%b %-40s %b%s%b → %b%s%b\n' \
+				"$C_YELLOW" "$ICON_WARN" "$C_RESET" "$name" "$C_YELLOW" "$cur" "$C_RESET" "$C_GREEN" "$want" "$C_RESET"
 			to_apply+=("$name=$want")
 		fi
 	done
@@ -2854,6 +3632,9 @@ stage_sysctl() {
 # состоянии LSM. Всё только читается — этап безопасно запускать на живом сервере.
 stage_audit() {
 	stage_banner "🔎" "17" "Аудит: порты, учётки, SUID, LSM"
+
+	# ss/ip на Alpine живут в iproute2, а не в busybox
+	_ensure_base_tools
 
 	# ── Прослушиваемые порты ──
 	echo -e "${C_BOLD}▸ Слушают порты:${C_RESET}"
@@ -2957,6 +3738,16 @@ stage_audit() {
 			echo "$changed" | sed 's/^/  /'
 		}
 	fi
+	# Alpine: целостность пакетов проверяется своим менеджером, а не debsums
+	if [[ "$PKG_MGR" == apk ]]; then
+		local apkv_changed
+		apkv_changed=$(apk audit --system 2>/dev/null | head -10)
+		[[ -n "$apkv_changed" ]] && {
+			echo ""
+			echo -e "${C_BOLD}▸ Изменённые файлы пакетов (apk audit):${C_RESET}"
+			echo "$apkv_changed" | sed 's/^/  /'
+		}
+	fi
 
 	echo ""
 	echo -e "  ${C_DIM}Этап только читает систему — ничего не изменено.${C_RESET}"
@@ -2973,27 +3764,46 @@ stage_audit() {
 # Оба модуля меняют аутентификацию, поэтому здесь строгий порядок:
 # бэкап → правка → проверка, что вход реально работает → иначе авто-откат.
 _pam_faillock_active() {
-	grep -qE '^[^#]*pam_faillock\.so' /etc/pam.d/common-auth 2>/dev/null
+	_pam_file_names
+	grep -qE '^[^#]*pam_faillock\.so' "$PAM_AUTH_FILE" 2>/dev/null
 }
 
 _pam_pwquality_active() {
-	grep -qE '^[^#]*pam_pwquality\.so' /etc/pam.d/common-password 2>/dev/null
+	_pam_file_names
+	grep -qE '^[^#]*pam_pwquality\.so' "$PAM_PASSWORD_FILE" 2>/dev/null
 }
 
 # Проверка, что изменение PAM не сломало аутентификацию:
 # pam_faillock/pwquality должны хотя бы загружаться
 _pam_sanity() {
 	local f
-	for f in /etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password; do
+	# Alpine держит базовые стеки в base-* (login/sshd/su их включают), Debian — в common-*
+	local files=(
+		/etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password
+		/etc/pam.d/base-auth /etc/pam.d/base-account /etc/pam.d/base-password
+	)
+	local seen=0
+	for f in "${files[@]}"; do
 		[[ -f "$f" ]] || continue
+		seen=1
 		[[ -r "$f" ]] || return 1
-		done
+	done
+	# ни одного файла — конфигурация PAM нестандартная, править наугад нельзя
+	((seen == 1)) || return 1
 	# pam_faillock хранит счётчики в /var/run/faillock — каталог должен создаваться
 	return 0
 }
 
 stage_pam() {
 	stage_banner "🔐" "18" "Пароли и блокировка учёток (PAM)"
+
+	# Alpine — тоже PAM (linux-pam), но стеки называются base-*. Ветка отдельная
+	# не из-за имён файлов, а из-за sshd: в базовой поставке он собран БЕЗ PAM,
+	# поэтому pam_faillock на вход по SSH не влияет (для этого openssh-server-pam).
+	if [[ "$PKG_MGR" == apk ]]; then
+		_stage_pam_apk
+		return $?
+	fi
 
 	if [[ "$PKG_MGR" != apt ]]; then
 		log_warn "Этап реализован для Debian/Ubuntu (pam_faillock через common-auth)"
@@ -3041,16 +3851,31 @@ stage_pam() {
 	update_stage_status "stage18_pam" "completed"
 }
 
+# Имена стеков PAM: на Alpine base-auth/base-account, в Debian/Ubuntu common-*.
+# Заполняются один раз в _pam_file_names, чтобы остальные функции не знали о разнице.
+_pam_file_names() {
+	if [[ "$PKG_MGR" == apk ]]; then
+		PAM_AUTH_FILE="/etc/pam.d/base-auth"
+		PAM_ACCOUNT_FILE="/etc/pam.d/base-account"
+		PAM_PASSWORD_FILE="/etc/pam.d/base-password"
+	else
+		PAM_AUTH_FILE="/etc/pam.d/common-auth"
+		PAM_ACCOUNT_FILE="/etc/pam.d/common-account"
+		PAM_PASSWORD_FILE="/etc/pam.d/common-password"
+	fi
+}
+
 # prepend-строка в common-auth: pam_faillock должен считаться ДО pam_unix
 _pam_enable_faillock() {
 	local deny="${1:-5}" unlock="${2:-900}"
+	_pam_file_names
 
 	if _pam_faillock_active; then
 		log_info "pam_faillock уже включён — обновляю лимиты"
 	else
-		backup_file "/etc/pam.d/common-auth" "stage18_pam"
+		backup_file "$PAM_AUTH_FILE" "stage18_pam"
 	fi
-	backup_file "/etc/pam.d/common-account" "stage18_pam"
+	backup_file "$PAM_ACCOUNT_FILE" "stage18_pam"
 	backup_file "/etc/security/faillock.conf" "stage18_pam"
 
 	# Политика
@@ -3070,7 +3895,7 @@ _pam_enable_faillock() {
 
 	# auth: preauth + authfail вокруг pam_unix
 	# account: счётчик ведётся при входе (строка preauth в account)
-	if ! grep -q "$OWN_MARK_PAM preauth" /etc/pam.d/common-auth 2>/dev/null; then
+	if ! grep -q "$OWN_MARK_PAM preauth" "$PAM_AUTH_FILE" 2>/dev/null; then
 		local tmp
 		tmp=$(mktemp)
 		{
@@ -3079,18 +3904,18 @@ _pam_enable_faillock() {
 			echo "$OWN_MARK faillock authfail (счетчик неудач)"
 			echo "auth	[default=die]		pam_faillock.so authfail"
 		} >"$tmp"
-		cat /etc/pam.d/common-auth >>"$tmp"
-		mv "$tmp" /etc/pam.d/common-auth
+		cat "$PAM_AUTH_FILE" >>"$tmp"
+		mv "$tmp" "$PAM_AUTH_FILE"
 	fi
-	if ! grep -q "$OWN_MARK_PAM account" /etc/pam.d/common-account 2>/dev/null; then
+	if ! grep -q "$OWN_MARK_PAM account" "$PAM_ACCOUNT_FILE" 2>/dev/null; then
 		local tmp
 		tmp=$(mktemp)
 		{
 			echo "$OWN_MARK faillock account (счётчик неудач при входе)"
 			echo "account	required		pam_faillock.so"
 		} >"$tmp"
-		cat /etc/pam.d/common-account >>"$tmp"
-		mv "$tmp" /etc/pam.d/common-account
+		cat "$PAM_ACCOUNT_FILE" >>"$tmp"
+		mv "$tmp" "$PAM_ACCOUNT_FILE"
 	fi
 
 	if ! _pam_sanity; then
@@ -3110,21 +3935,32 @@ _pam_disable_faillock() {
 		log_info "pam_faillock уже выключен"
 		return 0
 	}
-	backup_file "/etc/pam.d/common-auth" "stage18_pam"
-	backup_file "/etc/pam.d/common-account" "stage18_pam"
-	sed -i "/pam_faillock\.so/d; /$OWN_MARK_PAM/d" /etc/pam.d/common-auth /etc/pam.d/common-account
+	_pam_file_names
+	backup_file "$PAM_AUTH_FILE" "stage18_pam"
+	backup_file "$PAM_ACCOUNT_FILE" "stage18_pam"
+	sed -i "/pam_faillock\.so/d; /$OWN_MARK_PAM/d" "$PAM_AUTH_FILE" "$PAM_ACCOUNT_FILE"
 	log_ok "pam_faillock выключен (счётчики в /var/run/faillock можно удалить)"
 }
 
 _pam_enable_pwquality() {
-	if ! ls /usr/lib/*/security/pam_pwquality.so &>/dev/null; then
-		log_info "Устанавливаю libpam-pwquality..."
-		pkg_install_retry "libpam-pwquality" || {
-			log_err "Пакет libpam-pwquality недоступен"
-			return 1
-		}
+	_pam_file_names
+	# путь к модулю тоже разный: Debian — /usr/lib/<triplet>/security, Alpine — /lib/security
+	if ! ls /usr/lib/*/security/pam_pwquality.so /lib/security/pam_pwquality.so &>/dev/null; then
+		if [[ "$PKG_MGR" == apk ]]; then
+			log_info "Устанавливаю libpwquality..."
+			pkg_install_retry "libpwquality" || {
+				log_err "Пакет libpwquality недоступен"
+				return 1
+			}
+		else
+			log_info "Устанавливаю libpam-pwquality..."
+			pkg_install_retry "libpam-pwquality" || {
+				log_err "Пакет libpam-pwquality недоступен"
+				return 1
+			}
+		fi
 	fi
-	backup_file "/etc/pam.d/common-password" "stage18_pam"
+	backup_file "$PAM_PASSWORD_FILE" "stage18_pam"
 	backup_file "/etc/security/pwquality.conf" "stage18_pam"
 
 	# pam_pwquality вызывается из pam_unix через „nullok“ — проще включить
@@ -3136,8 +3972,8 @@ _pam_enable_pwquality() {
 			echo "$OWN_MARK pwquality"
 			echo "password	requisite		pam_pwquality.so retry=3"
 		} >"$tmp"
-		cat /etc/pam.d/common-password >>"$tmp"
-		mv "$tmp" /etc/pam.d/common-password
+		cat "$PAM_PASSWORD_FILE" >>"$tmp"
+		mv "$tmp" "$PAM_PASSWORD_FILE"
 	fi
 
 	if [[ ! -f /etc/security/pwquality.conf ]]; then : >/etc/security/pwquality.conf; fi
@@ -3165,28 +4001,102 @@ _pam_enable_pwquality() {
 
 # Откат PAM-правок до последнего бэкапа (используется, если проверка не прошла)
 _pam_restore() {
-	local bdir cand
-	for cand in $(find "${DATA_DIR}/backups" -maxdepth 2 -type d -name "stage18_pam" 2>/dev/null | sort -r); do
-		bdir="$cand"
-		break
-	done
-	[[ -n "$bdir" ]] || {
-		log_err "Бэкапов PAM нет — правьте /etc/pam.d вручную"
-		return 1
-	}
-	local bf bn
-	for bf in "$bdir"/*; do
-		[[ -f "$bf" ]] || continue
-		bn=$(basename "$bf")
-		case "$bn" in
-		common-auth) cp -a "$bf" /etc/pam.d/common-auth ;;
-		common-account) cp -a "$bf" /etc/pam.d/common-account ;;
-		common-password) cp -a "$bf" /etc/pam.d/common-password ;;
-		faillock.conf) cp -a "$bf" /etc/security/faillock.conf ;;
-		pwquality.conf) cp -a "$bf" /etc/security/pwquality.conf ;;
-		esac
+		local bdir cand
+		for cand in $(find "${DATA_DIR}/backups" -maxdepth 2 -type d -name "stage18_pam" 2>/dev/null | sort -r); do
+				bdir="$cand"
+				break
 		done
-	log_ok "PAM восстановлен из $bdir"
+		[[ -n "$bdir" ]] || {
+				log_err "Бэкапов PAM нет — правьте /etc/pam.d вручную"
+				return 1
+		}
+		# имена файлов различаются (Alpine base-*, Debian/Ubuntu common-*), поэтому
+		# восстанавливаем по имени бэкапа, а не по списку известных файлов
+		local bf bn
+		for bf in "$bdir"/*; do
+				[[ -f "$bf" ]] || continue
+				bn=$(basename "$bf")
+				case "$bn" in
+				common-auth | common-account | common-password | base-auth | base-account | base-password)
+						cp -a "$bf" "/etc/pam.d/$bn"
+						;;
+				faillock.conf | pwquality.conf) cp -a "$bf" "/etc/security/$bn" ;;
+				esac
+		done
+		log_ok "PAM восстановлен из $bdir"
+}
+
+# Alpine-ветка этапа 18. Отличие от Debian не в имени файла, а в sshd:
+# штатный пакет openssh-server не слинкован с PAM, и pam_faillock там мёртв.
+_stage_pam_apk() {
+	local fl=false pq=false
+	_pam_faillock_active && fl=true
+	_pam_pwquality_active && pq=true
+
+	echo -e "${C_BOLD}▸ Текущее состояние:${C_RESET}"
+	$fl && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_faillock: включён" ||
+		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_faillock: выключен"
+	if ls /lib/security/pam_pwquality.so &>/dev/null; then
+		$pq && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_pwquality: включён" ||
+			echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_pwquality: выключен"
+	else
+		echo -e "  ${C_DIM}pam_pwquality не установлен (пакет libpwquality)${C_RESET}"
+	fi
+	# Главная оговорка этапа: без PAM в sshd блокировка учётки на SSH не работает
+	if $SSHD_HAS_PAM; then
+		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  sshd с PAM — faillock действует и на вход по SSH"
+	else
+		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  sshd собран БЕЗ PAM: faillock подействует только на локальный вход"
+		echo -e "  ${C_DIM}    вход по SSH прикрывает Fail2Ban (этап 9), а не pam_faillock${C_RESET}"
+		echo -e "  ${C_DIM}    PAM для SSH: apk add openssh-server-pam и перезапуск sshd${C_RESET}"
+	fi
+
+	if [[ -f /etc/security/faillock.conf ]]; then
+		local deny unlock
+		deny=$(awk -F= '/^[[:space:]]*deny[[:space:]]*=/ {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf)
+		unlock=$(awk -F= '/^[[:space:]]*unlock_time[[:space:]]*=/ {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf)
+		echo -e "  ${C_DIM}faillock.conf: deny=${deny:-не задан} unlock_time=${unlock:-не задан}${C_RESET}"
+	fi
+
+	echo ""
+	echo "  1) Включить блокировку после неудачных попыток (pam_faillock)"
+	echo "  2) Требовать сложные пароли (pam_pwquality)"
+	echo "  3) Выключить pam_faillock"
+	echo "  4) Показать, собран ли sshd с PAM, и как это исправить"
+	echo "  S) Назад"
+	read -rp "  ${ICON_ARROW} " choice
+
+	case "$choice" in
+	1)
+		_pam_enable_faillock
+		# без PAM в sshd предупреждаем сразу, а не после «успеха»
+		$SSHD_HAS_PAM || log_warn "SSH-вход это не защитит: sshd без PAM (см. пункт 4)"
+		;;
+	2) _pam_enable_pwquality ;;
+	3) _pam_disable_faillock ;;
+	4)
+		echo ""
+		echo -e "  ${C_BOLD}PAM в sshd${C_RESET}"
+		if $SSHD_HAS_PAM; then
+			echo "    sshd слинкован с PAM — pam_faillock учитывается при входе"
+			[[ -f /etc/pam.d/sshd ]] && echo "    /etc/pam.d/sshd: есть"
+		else
+			echo "    Сейчас: sshd без PAM, /etc/pam.d/sshd отсутствует"
+			echo ""
+			echo "    apk add openssh-server-pam"
+			echo "    rc-service sshd restart"
+			echo ""
+			echo -e "    ${C_YELLOW}Ставьте этот пакет только имея под рукой консоль:${C_RESET}"
+			echo "    новый sshd читает PAM, а сломанный PAM-стек закрывает вход совсем."
+		fi
+		echo ""
+		read -rp "  Enter..." _
+		;;
+	*) log_info "Пропущено" ;;
+	esac
+
+	update_stage_status "stage18_pam" "completed"
+	return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3211,7 +4121,7 @@ stage_auditd() {
 	mkdir -p "$rules_dir"
 
 	echo -e "${C_BOLD}▸ Текущее состояние:${C_RESET}"
-	if systemctl is-active --quiet auditd 2>/dev/null; then
+	if svc_is_active auditd; then
 		echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  auditd запущен"
 	else
 		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  auditd не запущен"
@@ -3227,7 +4137,7 @@ stage_auditd() {
 	echo "    - изменения SSH-конфигов и authorized_keys"
 	echo "    - команды от имени root (execve с euid=0)"
 	echo "    - загрузка/выгрузка модулей ядра"
-	echo "    - изменения времени (timedatectl/settimeofday)"
+	echo "    - изменения времени (settimeofday/clock_settime)"
 	echo "    - монтирования"
 	echo ""
 	confirm "Применить правила?" || {
@@ -3277,28 +4187,35 @@ EOF
 		log_warn "augenrules не найден — правила применятся после перезагрузки"
 	fi
 
-	systemctl enable auditd 2>/dev/null || true
-	systemctl restart auditd 2>/dev/null || systemctl start auditd 2>/dev/null || true
+	svc_enable auditd || true
+	svc_restart auditd || svc_start auditd || true
 	sleep 2
 
 	local active now_rules
 	active=false
-	systemctl is-active --quiet auditd && active=true
+	svc_is_active auditd && active=true
 	now_rules=$(auditctl -l 2>/dev/null | grep -c . || true)
 
 	if ! $active; then
 		# Частая причина в контейнерах (LXC/OpenVZ/Docker): нет прав на
 		# cap_sys_nice/аудит, и auditd падает при старте. Сообщаем точно.
 		local why=""
-		if journalctl -u auditd -n 20 --no-pager 2>/dev/null | grep -qi 'Cannot change priority\|Operation not permitted'; then
+		# journalctl есть только на systemd-системах; на Alpine смотрим syslog
+		local alog=""
+		if $HAS_SYSTEMD; then
+			alog=$(journalctl -u auditd -n 20 --no-pager 2>/dev/null)
+		else
+			alog=$(tail -n 50 /var/log/messages 2>/dev/null | grep -i auditd)
+		fi
+		if grep -qi 'Cannot change priority\|Operation not permitted' <<<"$alog"; then
 			why="контейнер не даёт прав на аудит (нет cap_sys_nice/audit_control)"
 		else
-			why="смотрите: systemctl status auditd"
+			why="смотрите: systemctl status auditd / rc-service auditd status"
 		fi
 		log_err "auditd не запустился: $why"
 		log_info "Правила остались в $rules — на хосте (или в VM) они заведутся"
 		# не оставляем неработающий сервис в цикле перезапусков
-		systemctl reset-failed auditd 2>/dev/null || true
+		$HAS_SYSTEMD && systemctl reset-failed auditd 2>/dev/null || true
 		update_stage_status "stage19_auditd" "failed"
 		return 1
 	fi
@@ -3375,6 +4292,9 @@ _ipv6_session_risk() {
 
 stage_ipv6() {
 	stage_banner "$ICON_GLOBE" "20" "IPv6: включить или отключить"
+
+	# ip -6 addr show требует iproute2 (busybox ip не умеет scope global)
+	_ensure_base_tools
 
 	local cur
 	cur=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
@@ -3499,12 +4419,327 @@ _ipv6_enable() {
 	fi
 }
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 21: ЛОКАЛЬНЫЙ ВХОД (КОНСОЛЬ ПРОВАЙДЕРА)
+# ═══════════════════════════════════════════════════════════════════
+# У VPS кроме SSH есть «внутренняя консоль»: VNC/веб-терминал у провайдера
+# или последовательный порт. Это второй вход в систему — пароли там можно
+# подбирать без Fail2Ban, а root по умолчанию туда пускают. Этап закрывает
+# локальные getty и вход root на консоли, оставляя только SSH.
+#
+# Честные границы, о которых скрипт говорит вслух:
+#  - локальный вход закрывается изнутри и возвращается пунктом 2 того же этапа;
+#  - в LXC/incus `pct enter` и `lxc-attach` идут в обход getty — это доступ с
+#    хоста от root, а не вход в систему, и изнутри контейнера не закрывается;
+#  - rescue/recovery режим провайдера — отдельная загрузка, её это не касается;
+#  - SSH не ломается: pam_securetty трогает только /etc/pam.d/login.
+#
+# Два init: systemd — getty-юниты (mask + stop), OpenRC (Alpine) — строки
+# respawn в /etc/inittab.
+
+_state_console_file() { printf '%s' "${DATA_DIR}/.console_state"; }
+
+# Маркер выключенной консоли в /etc/inittab — свой, а не $OWN_MARK («# seq_vps»):
+# с ним вышло бы «# # seq_vps ...», а sed с разделителем # падает на решётке
+# внутри шаблона.
+_CONSOLE_MARK="# 4script: локальный вход отключён: "
+
+_virt_type() {
+	[[ -f /.dockerenv ]] && { echo docker; return; }
+	local c=""
+	[[ -r /run/systemd/container ]] && c=$(</run/systemd/container)
+	case "$c" in
+	lxc | incus) echo lxc; return ;;
+	docker | podman) echo docker; return ;;
+	systemd-nspawn) echo nspawn; return ;;
+	esac
+	grep -qa 'container=lxc' /proc/1/environ 2>/dev/null && { echo lxc; return; }
+	grep -qa 'container=systemd-nspawn' /proc/1/environ 2>/dev/null && { echo nspawn; return; }
+	echo host
+}
+
+_virt_title() {
+	case "$1" in
+	host) echo "VPS/железо" ;;
+	lxc) echo "LXC/incus контейнер" ;;
+	docker) echo "Docker" ;;
+	nspawn) echo "systemd-nspawn" ;;
+	*) echo "$1" ;;
+	esac
+}
+
+# Что сейчас может пустить в систему с консоли. Пусто = локальный вход закрыт.
+# Важно: getty обычно не запущен заранее (VNC никто не открывал) — поэтому
+# смотрим и активные, и включённые в автозагрузку инстансы, а закрытым
+# считаем только замаскированный шаблон getty@.service (маска закрывает всё).
+_console_getty_state() {
+	local active=() n
+	if $HAS_SYSTEMD; then
+		[[ "$(systemctl is-enabled getty@.service 2>/dev/null)" == masked ]] && return 0
+		while read -r n; do
+			[[ -n "$n" ]] && active+=("$n")
+		done < <(systemctl list-units --no-legend --plain --type=service --state=active \
+			'getty@*.service' 'serial-getty@*.service' 'console-getty.service' 2>/dev/null |
+			awk '{print $1}')
+		if [[ ${#active[@]} -eq 0 ]]; then
+			while read -r n; do
+				[[ -n "$n" ]] && active+=("$n")
+			done < <(systemctl list-unit-files --no-legend --plain --state=enabled \
+				'getty@*.service' 'serial-getty@*.service' 2>/dev/null | awk '{print $1}')
+		fi
+	elif [[ -f /etc/inittab ]]; then
+		while read -r n; do
+			[[ -n "$n" ]] && active+=("$n")
+		done < <(awk -F: '/^tty[0-9S]+::respawn:/ && /getty/ {print $1}' /etc/inittab)
+	fi
+	printf '%s' "${active[*]:-}"
+}
+
+# Пускает ли root на локальной консоли: allowed | denied | n/a
+_console_root_state() {
+	local login=/etc/pam.d/login
+	if [[ ! -f "$login" ]] || ! grep -qE '^[^#]*pam_securetty\.so' "$login" 2>/dev/null; then
+		echo n/a
+		return
+	fi
+	if [[ -s /etc/securetty ]]; then echo allowed; else echo denied; fi
+}
+
+# root на консоли: pam_securetty читает /etc/securetty, и пустой файл значит
+# «ни один tty не пускает root». Файл есть в Debian/RHEL, там модуль уже
+# подключён в /etc/pam.d/login. На Alpine файла нет — там вход закрывает
+# отключение getty, и придумывать лишнее не нужно.
+_console_root_disable() {
+	if [[ ! -f /etc/securetty ]]; then
+		log_info "root на консоли: /etc/securetty нет — вопрос закрыт отключением getty"
+		return 0
+	fi
+	if ! grep -qE '^[^#]*pam_securetty\.so' /etc/pam.d/login 2>/dev/null; then
+		log_warn "pam_securetty не подключён в /etc/pam.d/login — root на консоли прикрыт только отключением getty"
+		return 0
+	fi
+	backup_file "/etc/securetty" "stage21_console"
+	: >/etc/securetty
+	log_ok "root больше не входит с локальной консоли (/etc/securetty пуст)"
+}
+
+# Возврат состояния getty: то, что было активно до отключения, лежит в
+# .console_state — иначе пришлось бы угадывать, включать tty2-tty6 или нет.
+_console_disable() {
+	local virt
+	virt=$(_virt_type)
+	_ssh_port_refresh
+	local state
+	state=$(_state_console_file)
+
+	echo ""
+	if [[ "$virt" == lxc || "$virt" == docker ]]; then
+		log_warn "Это контейнер ($(_virt_title "$virt")):"
+		log_info "  вход с консоли провайдера закроется, но 'pct enter' / 'lxc-attach'"
+		log_info "  работают в обход getty — это доступ с хоста от root, изнутри его не закрыть"
+	fi
+	log_warn "После этого войти можно будет ТОЛЬКО по SSH:"
+	echo "    - виртуальные консоли (tty1-tty6) и последовательный порт отключаются"
+	echo "    - root с консоли провайдера входить не сможет"
+	echo ""
+	if $HAS_SYSTEMD && ! svc_is_active "$SSH_SERVICE"; then
+		log_err "SSH сейчас НЕ запущен — отключение консоли оставит сервер без входа вообще"
+	elif ! _ssh_port_reachable "$CURRENT_SSH_PORT"; then
+		log_warn "Порт $CURRENT_SSH_PORT не отвечает на локальную пробу"
+	else
+		log_ok "SSH отвечает на порту $CURRENT_SSH_PORT"
+	fi
+	log_warn "Проверьте вход из ДРУГОГО окна: ssh -p $CURRENT_SSH_PORT root@<адрес>"
+	log_info "Вернуть доступ: этот же этап, пункт 2 (или клавиша R). Rescue у провайдера тоже работает."
+	confirm "Отключить локальный вход?" || {
+		log_info "Отменено"
+		return 0
+	}
+
+	if $HAS_SYSTEMD; then
+		local was masks=(getty@.service serial-getty@.service console-getty.service autovt@.service) ok=() m
+		was=$(_console_getty_state)
+		for m in "${masks[@]}"; do
+			systemctl mask "$m" &>/dev/null && ok+=("$m")
+		done
+		svc_daemon_reload
+		# уже запущенный getty маска не останавливает — гасим его отдельно
+		for m in $was; do systemctl stop "$m" &>/dev/null || true; done
+		{
+			echo "init=systemd"
+			echo "getty_was=$was"
+			echo "masks=${ok[*]}"
+		} >"$state"
+		log_info "getty-юниты замаскированы (${ok[*]})"
+	else
+		backup_file "/etc/inittab" "stage21_console"
+		local tmp n
+		tmp=$(mktemp)
+		while IFS= read -r n; do
+			if [[ "$n" =~ ^tty[0-9S]+::respawn: ]] && [[ "$n" == *getty* ]]; then
+				printf '%s\n' "$_CONSOLE_MARK$n"
+			else
+				printf '%s\n' "$n"
+			fi
+		done </etc/inittab >"$tmp"
+		cp "$tmp" /etc/inittab
+		rm -f "$tmp"
+		# init перечитает inittab по telinit q; уже работающие getty надо погасить
+		telinit q &>/dev/null || true
+		pkill -x getty &>/dev/null || true
+		printf 'init=openrc\n' >"$state"
+		log_info "Локальные getty выключены в /etc/inittab"
+	fi
+
+	_console_root_disable
+
+	sleep 1
+	local left
+	left=$(_console_getty_state)
+	if [[ -z "$left" ]]; then
+		log_ok "Локальный вход закрыт — остался только SSH"
+	else
+		log_warn "Ещё активны: $left (закроются после перезагрузки)"
+	fi
+	update_stage_status "stage21_console" "completed"
+}
+
+# Вернуть локальный вход: снять маски (или наши комментарии) и восстановить
+# /etc/securetty. Вызывается и пунктом 2, и откатом этапа (клавиша R).
+_console_enable() {
+	local state
+	state=$(_state_console_file)
+	# ключи читаем в отдельные имена: masks/getty_was — массивы в _console_disable,
+	# путать их с одноимёнными строками не стоит
+	local getty_list="" mask_list="" key val
+	if [[ -f "$state" ]]; then
+		while IFS='=' read -r key val; do
+			case "$key" in
+			getty_was) getty_list="$val" ;;
+			masks) mask_list="$val" ;;
+			esac
+		done <"$state"
+	fi
+
+	if $HAS_SYSTEMD; then
+		# счётчики названы иначе, чем массив ok в _console_disable: общие имена
+		# в разных функциях сбивают и shellcheck, и читателя
+		local m n_unmasked=0
+		for m in ${mask_list:-getty@.service serial-getty@.service console-getty.service autovt@.service}; do
+			systemctl unmask "$m" &>/dev/null && n_unmasked=$((n_unmasked + 1))
+		done
+		svc_daemon_reload
+		# возвращаем ровно те консоли, что были активны до отключения
+		local u n_started=0
+		for u in ${getty_list:-getty@tty1.service}; do
+			systemctl start "$u" &>/dev/null && n_started=$((n_started + 1))
+		done
+		log_ok "Маски сняты ($n_unmasked), запущено консолей: $n_started"
+	elif [[ -f /etc/inittab ]]; then
+		backup_file "/etc/inittab" "stage21_console"
+		sed -i "s|^${_CONSOLE_MARK}||" /etc/inittab
+		telinit q &>/dev/null || true
+		log_ok "Локальные getty возвращены в /etc/inittab"
+		hint "работающие getty поднимутся заново после telinit q или перезагрузки"
+	fi
+
+	_console_root_enable
+	rm -f "$state"
+	log_info "Проверьте: переключитесь на консоль провайдера (VNC/веб-терминал)"
+}
+
+_console_root_enable() {
+	local bf
+	for bf in $(find "${DATA_DIR}/backups" -maxdepth 2 -name "securetty" -type f 2>/dev/null | sort -r); do
+		cp -a "$bf" /etc/securetty
+		log_ok "Восстановлен /etc/securetty из бэкапа"
+		return 0
+	done
+	return 0
+}
+
+# Короткая расшифровка состояния для меню и для клавиши P
+_console_report() {
+	local virt getty root_state
+	virt=$(_virt_type)
+	getty=$(_console_getty_state)
+	root_state=$(_console_root_state)
+	printf '  %-20s %s\n' "Виртуализация:" "$(_virt_title "$virt")"
+	if [[ -n "$getty" ]]; then
+		printf '  %-20s %s\n' "Локальный вход:" "$getty"
+	else
+		printf '  %-20s %s\n' "Локальный вход:" "закрыт (вход только по SSH)"
+	fi
+	case "$root_state" in
+	allowed) printf '  %-20s %s\n' "root на консоли:" "разрешён" ;;
+	denied) printf '  %-20s %s\n' "root на консоли:" "запрещён" ;;
+	*) printf '  %-20s %s\n' "root на консоли:" "не проверяется (нет pam_securetty)" ;;
+	esac
+}
+
+stage_console() {
+	stage_banner "🖥" "21" "Локальный вход (консоль провайдера)"
+
+	echo -e "${C_BOLD}▸ Сейчас:${C_RESET}"
+	_console_report
+	echo ""
+	echo -e "  ${C_DIM}Консоль провайдера — это второй вход в систему мимо SSH: пароли там
+  подбираются без Fail2Ban, а root туда пускают по умолчанию.${C_RESET}"
+	echo ""
+	echo "  1) Отключить локальный вход (оставить только SSH)"
+	echo "  2) Вернуть локальный вход"
+	echo "  3) Показать, что именно будет изменено"
+	echo "  S) Назад"
+	echo ""
+	read -rp "  ${ICON_ARROW} " cchoice
+
+	case "$cchoice" in
+	1)
+		local virt
+		virt=$(_virt_type)
+		if [[ -z "$(_console_getty_state)" ]] && [[ "$(_console_root_state)" != "allowed" ]]; then
+			log_info "Локальный вход уже закрыт"
+			update_stage_status "stage21_console" "completed"
+			return 0
+		fi
+		if [[ "$virt" == lxc || "$virt" == docker ]]; then
+			log_warn "Контейнер: 'pct enter'/'lxc-attach' останутся доступны с хоста (обход getty)"
+		fi
+		_console_disable
+		;;
+	2) _console_enable ;;
+	3)
+		echo ""
+		if $HAS_SYSTEMD; then
+			echo -e "  ${C_BOLD}systemd:${C_RESET} будут замаскированы юниты консолей"
+			echo "    getty@.service, serial-getty@.service, console-getty.service, autovt@.service"
+			echo "    и остановлены уже запущенные getty"
+		elif [[ -z "$(_console_getty_state)" ]]; then
+			echo -e "  ${C_BOLD}OpenRC:${C_RESET} консоли уже отключены — строк для правки нет"
+		else
+			echo -e "  ${C_BOLD}OpenRC (/etc/inittab):${C_RESET} строки запуска getty будут закомментированы"
+			grep -nE '^tty[0-9S]+::respawn:' /etc/inittab 2>/dev/null | sed 's/^/    /'
+		fi
+		echo ""
+		if [[ -f /etc/securetty ]] && grep -qE '^[^#]*pam_securetty\.so' /etc/pam.d/login 2>/dev/null; then
+			echo -e "  ${C_BOLD}root на консоли:${C_RESET} /etc/securetty будет очищен"
+			echo -e "    ${C_DIM}(файл резервируется, вход по SSH не затрагивается)${C_RESET}"
+		else
+			echo -e "  ${C_BOLD}root на консоли:${C_RESET} отдельно не трогаем — getty выключается целиком"
+		fi
+		echo ""
+		read -rp "  Enter..." _
+		;;
+	*) log_info "Пропущено" ;;
+	esac
+}
+
 # ═══════════════════════════════════════════════════════════════════
 #  ЭТАП R: ОТКАТ
 # ═══════════════════════════════════════════════════════════════════
 
 stage_rollback() {
-	stage_banner "↩" "R" "Откат этапа"
 
 	# список этапов берём из реестра — не расходится с меню
 	local def num key icon title cat fn
@@ -3513,7 +4748,7 @@ stage_rollback() {
 		[[ -n "$key" ]] || continue
 		printf '  %2s) %s\n' "$num" "$title"
 	done
-	echo "  ${C_DIM}Откат восстанавливает файлы этапа из последнего бэкапа.${C_RESET}"
+	echo -e "  ${C_DIM}Откат восстанавливает файлы этапа из последнего бэкапа.${C_RESET}"
 	read -rp "  ${ICON_ARROW} " sn
 
 	local stage=""
@@ -3557,6 +4792,7 @@ stage_rollback() {
 			[[ "$bn" == "sources.list" ]] && op="/etc/apt/sources.list"
 			[[ "$bn" == "sources.list.d" ]] && op="/etc/apt/sources.list.d"
 			[[ "$bn" == "yum.repos.d" ]] && op="/etc/yum.repos.d"
+			[[ "$bn" == "repositories" ]] && op="/etc/apk/repositories"
 			;;
 		stage4_ssh_key)
 			read -rp "  Пользователь для отката ключа: " ru
@@ -3575,8 +4811,32 @@ stage_rollback() {
 			[[ "$bn" == "20auto-upgrades" ]] && op="/etc/apt/apt.conf.d/20auto-upgrades"
 			[[ "$bn" == "50unattended-upgrades" ]] && op="/etc/apt/apt.conf.d/50unattended-upgrades"
 			[[ "$bn" == "automatic.conf" ]] && op="/etc/dnf/automatic.conf"
+			[[ "$bn" == "4script-security-update" ]] && op="/etc/periodic/daily/4script-security-update"
 			;;
-		stage10_dns) op="/etc/resolv.conf" ;;
+		stage10_dns)
+			[[ "$bn" == "resolv.conf" ]] && op="/etc/resolv.conf"
+			[[ "$bn" == "resolvconf.conf" ]] && op="/etc/resolvconf.conf"
+			;;
+		stage18_pam | stage19_auditd | stage9_intrusion)
+			# в этих этапах бэкапится несколько файлов с разными путями, причём
+			# PAM-стеки на Alpine и Debian называются по-разному — поэтому
+			# восстанавливаем по имени бэкапа, а не по списку известных файлов
+			case "$bn" in
+			common-auth | common-account | common-password | base-auth | base-account | base-password)
+				op="/etc/pam.d/$bn"
+				;;
+			faillock.conf | pwquality.conf) op="/etc/security/$bn" ;;
+			jail.local) op="/etc/fail2ban/jail.local" ;;
+			99-seq-vps.rules) op="/etc/audit/rules.d/99-seq-vps.rules" ;;
+			esac
+			;;
+		stage21_console)
+			# маски systemd — не файлы: их снимает _console_enable после копирования
+			case "$bn" in
+			inittab) op="/etc/inittab" ;;
+			securetty) op="/etc/securetty" ;;
+			esac
+			;;
 		stage16_sysctl)
 			[[ "$bn" == "99-seq-vps.conf" ]] && op="/etc/sysctl.d/99-seq-vps.conf"
 			;;
@@ -3590,9 +4850,14 @@ stage_rollback() {
 		}
 	done
 
+	if [[ "$stage" == stage21_console ]]; then
+		# файлы уже вернулись из бэкапа, осталось снять маски getty и включить консоли
+		_console_enable
+	fi
+
 	if [[ "$stage" == stage5_ssh_config || "$stage" == stage6_sftp_user ]]; then
 		if sshd -t 2>&1 | tee -a "$LOG_FILE"; then
-			systemctl restart "$SSH_SERVICE" 2>/dev/null && log_ok "SSH перезапущен"
+			svc_restart "$SSH_SERVICE" && log_ok "SSH перезапущен"
 		else
 			log_err "Откаченный конфиг невалиден — SSH НЕ перезапущен, проверьте вручную"
 		fi
@@ -3624,8 +4889,8 @@ show_stage_help() {
 		done
 		echo ""
 	done
-	echo "  ${C_DIM}Порядок для нового сервера: 0, 1, 2, 4 → проверь вход по ключу…"
-	echo "  ${C_DIM}→ 7 (фаервол) → 5 (порт и пароли) → 8, 9 → 3 (пароль root) → остальное.${C_RESET}"
+	echo -e "  ${C_DIM}Порядок для нового сервера: 0, 1, 2, 4 → проверь вход по ключу…"
+	echo -e "  ${C_DIM}→ 7 (фаервол) → 5 (порт и пароли) → 8, 9 → 3 (пароль root) → остальное.${C_RESET}"
 	printf "  ${C_DIM}Выполнено: %d из %d этапов${C_RESET}\n" "$done_done" "$done_total"
 	echo ""
 	read -rp "  Enter — в меню... " _
@@ -3756,6 +5021,23 @@ show_profiles() {
 	_show_kv "PerSourcePenalties" "$(_sshd_option "$sc" persourcepenalties 'нет (OpenSSH < 9.8)')"
 	_show_conf_file "$SSHD_CONFIG_D/$SEQ_SSHD_DROPIN" "drop-in SSH"
 
+	# ── Локальный вход ──
+	echo ""
+	echo -e "${C_BOLD}🖥  Локальный вход (консоль)${C_RESET}"
+	local cgetty croot
+	cgetty=$(_console_getty_state)
+	croot=$(_console_root_state)
+	if [[ -n "$cgetty" ]]; then
+		_show_kv "getty" "активны: $cgetty" "$C_YELLOW"
+	else
+		_show_kv "getty" "выключены (вход только по SSH)" "$C_GREEN"
+	fi
+	case "$croot" in
+	allowed) _show_kv "root на консоли" "разрешён" "$C_YELLOW" ;;
+	denied) _show_kv "root на консоли" "запрещён" "$C_GREEN" ;;
+	*) _show_kv "root на консоли" "не проверяется (нет pam_securetty)" "$C_DIM" ;;
+	esac
+
 	# ── Фаервол ──
 	echo ""
 	echo -e "${C_BOLD}${ICON_FIRE}  Фаервол ($(_fw_cmd))${C_RESET}"
@@ -3790,6 +5072,11 @@ show_profiles() {
 	# ── PAM / блокировки ──
 	echo ""
 	echo -e "${C_BOLD}🔐  Пароли и блокировки (PAM)${C_RESET}"
+	if [[ "$PKG_MGR" != apt && "$PKG_MGR" != apk ]]; then
+		_show_kv "PAM" "правится только вручную (${PKG_MGR})" "$C_DIM"
+	elif [[ "$PKG_MGR" == apk && "$SSHD_HAS_PAM" != true ]]; then
+		_show_kv "sshd с PAM" "нет — faillock не влияет на SSH-вход" "$C_YELLOW"
+	fi
 	if _pam_faillock_active; then
 		_show_kv "pam_faillock" "включён" "$C_GREEN"
 		grep -A2 "^$OWN_MARK" /etc/security/faillock.conf 2>/dev/null | grep -E 'deny|unlock_time' | sed 's/^/    /'
@@ -3805,7 +5092,7 @@ show_profiles() {
 	# ── Аудит событий ──
 	echo ""
 	echo -e "${C_BOLD}📋  Аудит событий (auditd)${C_RESET}"
-	if systemctl is-active --quiet auditd 2>/dev/null; then
+	if svc_is_active auditd; then
 		_show_kv "auditd" "запущен, правил $(auditctl -l 2>/dev/null | grep -c .)" "$C_GREEN"
 	else
 		_show_kv "auditd" "не запущен" "$C_DIM"
@@ -3820,6 +5107,8 @@ show_profiles() {
 		au="unattended-upgrades: $(grep -c 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades) настроек"
 	elif [[ -f /etc/dnf/automatic.conf ]]; then
 		au="dnf-automatic"
+	elif [[ -f /etc/periodic/daily/4script-security-update ]]; then
+		au="ежедневный apk upgrade (periodic/daily)"
 	fi
 	_show_kv "Автообновления" "$au"
 	local rt="выключена"
@@ -3827,6 +5116,12 @@ show_profiles() {
 		rt=$(grep -oE 'Automatic-Reboot "true"' /etc/apt/apt.conf.d/50unattended-upgrades-local &>/dev/null && echo "включена" || echo "выключена")
 	fi
 	_show_kv "Авто-перезагрузка" "$rt"
+	# init системы: важно видеть, чем скрипт управляет сервисами (systemctl или rc-*)
+	_show_kv "Init / сервисы" "$INIT_SYSTEM ($([[ $HAS_SYSTEMD == true ]] && echo systemctl || echo rc-service/rc-update))"
+	if [[ "$PKG_MGR" == apk ]]; then
+		_show_kv "NTP (chrony)" "$(svc_is_active chronyd && echo "запущен" || echo "не запущен")"
+		_show_conf_file "/etc/timezone" "часовой пояс"
+	fi
 	_show_kv "DNS ($(_dns_backend))" "$(tr '\n' ' ' <<<"$(_dns_current)")"
 	_show_conf_file "/etc/systemd/resolved.conf.d/10-seq-vps.conf" "DNS через resolved"
 
@@ -4193,6 +5488,27 @@ remote_main() {
 		log_info "Пользователь не root — запуск будет через sudo"
 	fi
 
+	# 2a. Скрипт написан на bash, а на голом Alpine его нет (там /bin/sh — ash).
+	# Без этой проверки удалённый прогон падает первой же строкой
+	# «bash: not found» — и выглядит это как непонятная ошибка ssh.
+	if ! remote_run_remote 'command -v bash >/dev/null' &>/dev/null; then
+		if remote_run_remote 'command -v apk >/dev/null' &>/dev/null; then
+			log_warn "На сервере нет bash (Alpine) — ставлю его"
+			if remote_run_remote "${REMOTE_SUDO:+$REMOTE_SUDO }apk add --no-cache bash" &>/dev/null &&
+				remote_run_remote 'command -v bash >/dev/null' &>/dev/null; then
+				log_ok "bash установлен на сервере"
+			else
+				log_err "Не удалось поставить bash на сервере (нужен доступ в сеть)"
+				log_info "Вручную на сервере: apk add bash"
+				return 1
+			fi
+		else
+			log_err "На сервере нет bash — запустить скрипт нечем"
+			log_info "Установите bash пакетным менеджером сервера и повторите"
+			return 1
+		fi
+	fi
+
 	if $REMOTE_ATTACH_ONLY; then
 		remote_attach
 		return $?
@@ -4214,6 +5530,9 @@ remote_main() {
 
 	# mux нет — запускаем прямо в этой сессии (обрыв прервёт настройку)
 	log_warn "На сервере нет screen/tmux: запускаю напрямую — обрыв связи прервёт настройку"
+	# alpine-base не содержит screen/tmux, но у скрипта есть свои пакеты: в фоне
+	# сессия не оборвётся при потере связи
+	log_info "  Поставьте на сервере: apk add screen  (или tmux)"
 	local -a opts=()
 	while IFS= read -r -d '' o; do opts+=("$o"); done < <(_remote_ssh_opts any)
 	local -a ka=()
@@ -4230,7 +5549,8 @@ show_help() {
 	echo "4Script — simple-server-security-script · v${SCRIPT_VERSION}"
 	echo ""
 	echo "  Комплексная настройка безопасности VPS сервера."
-	echo "  Поддерживает: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux."
+	echo "  Поддерживает: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux, Alpine."
+	echo "  Init: systemd (Debian/RHEL) либо OpenRC (Alpine)."
 	echo ""
 	echo "  Использование:"
 	echo "    sudo ./4script.sh                     — интерактивное меню на этом сервере"
