@@ -322,4 +322,56 @@ grep -q '«Connection refused»' 4script.sh || fail 'SSH diagnostics lost the Co
 declare -F _ssh_diagnose >/dev/null || fail 'missing _ssh_diagnose'
 grep -q 'Почему не пускает SSH' 4script.sh || fail 'stage 5 has no diagnostics menu item'
 
-printf 'OK: 4script unit checks passed\n'
+# ── Показ выполняемых команд (UI) ────────────────────────────────────
+for fn in step_run step_note steps_total pad _now_us; do
+	declare -F "$fn" >/dev/null || fail "missing UI helper: $fn"
+done
+# шаг обязан показать и описание, и саму команду, и результат со временем
+step_body=$(sed -n '/^step_run()/,/^}/p' 4script.sh)
+grep -q '\$ %s' <<<"$step_body" || fail 'step_run does not print the command it runs'
+grep -q 'ICON_OK' <<<"$step_body" || fail 'step_run does not print a success mark'
+grep -q 'STEP_OUT' <<<"$step_body" || fail 'step_run does not keep output for diagnostics'
+grep -q 'UI_VERBOSE' <<<"$step_body" || fail 'step_run ignores --verbose'
+grep -q 'UI_QUIET' <<<"$step_body" || fail 'step_run ignores --quiet'
+grep -q -- '--verbose' 4script.sh || fail '--verbose flag missing from main'
+grep -q -- '--quiet' 4script.sh || fail '--quiet flag missing from main'
+# команда должна печататься копипастабельно (%q), а не склеенной через $*
+grep -q "printf '%q '" <<<"$step_body" || fail 'step_run must quote arguments with %q'
+# счётчик шагов не должен переполняться
+grep -q 'STEP_NO <= STEP_TOTAL' <<<"$step_body" || fail 'step counter can print 4/3'
+
+# pad(): printf %-Ns в bash считает БАЙТЫ, поэтому кириллица в колонках
+# разъезжается. Свой pad считает символы.
+assert_eq "$(printf '%s' "$(pad 'аб' 6)" | LC_ALL=C.UTF-8 wc -m | tr -d ' ')" '6' 'pad counts characters'
+assert_eq "$(pad 'abc' 2)" 'abc' 'pad never truncates'
+[[ "$(printf '%s' "$(pad 'Служба:' 22)" | LC_ALL=C.UTF-8 wc -m | tr -d ' ')" == '22' ]] ||
+	fail 'pad does not pad Cyrillic to the requested width'
+
+# _pick_from: меню обязано идти в stderr, иначе pick=$(...) захватит текст меню
+pick_body=$(sed -n '/^_pick_from()/,/^}/p' 4script.sh)
+grep -q '>&2' <<<"$pick_body" || fail '_pick_from leaks its menu into stdout'
+
+# ── Этап 22 (Docker) и 23 (автозапуск) ───────────────────────────────
+grep -q 'stage22_docker' 4script.sh || fail 'stage 22 (docker) missing from the registry'
+grep -q 'stage23_autostart' 4script.sh || fail 'stage 23 (autostart) missing from the registry'
+for fn in _docker_state _docker_report _docker_install _docker_remove stage_docker; do
+	declare -F "$fn" >/dev/null || fail "missing docker helper: $fn"
+done
+# установка идёт из официального репозитория, а не docker.io из дистрибутива
+grep -q 'download.docker.com' 4script.sh || fail 'docker install must use the official repository'
+grep -q 'docker-ce docker-ce-cli containerd.io' 4script.sh || fail 'docker package list lost its core packages'
+grep -q 'docker-buildx-plugin docker-compose-plugin' 4script.sh || fail 'docker buildx/compose plugins missing'
+grep -q '/etc/apt/keyrings/docker.asc' 4script.sh || fail 'docker GPG key step missing'
+grep -q 'docker.sources' 4script.sh || fail 'docker deb822 sources file missing'
+# apk отдаёт 1 и при удачной установке — проверяем факт, как в pkg_install_retry
+docker_apk=$(sed -n '/^_docker_install_apk()/,/^}/p' 4script.sh)
+grep -q '_apk_all_installed' <<<"$docker_apk" || fail 'docker apk install trusts apk exit code'
+# состояние проверяется фактом (docker info), а не только статусом службы
+grep -q 'docker info' 4script.sh || fail 'docker state is not verified via docker info'
+for fn in _autostart_enabled _autostart_disabled _autostart_level _pick_from stage_autostart; do
+	declare -F "$fn" >/dev/null || fail "missing autostart helper: $fn"
+done
+grep -q 'svc_disable "\$pick"' 4script.sh || fail 'autostart cannot disable an item'
+grep -q 'svc_enable "\$pick"' 4script.sh || fail 'autostart cannot enable an item'
+
+printf 'OK: 4script unit checks passed\n' 

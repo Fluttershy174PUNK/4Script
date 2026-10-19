@@ -139,6 +139,8 @@ readonly STAGE_DEFS=(
 	"19|stage19_auditd|📋|Аудит событий (auditd)|protect|stage_auditd"
 	"20|stage20_ipv6|🌐|IPv6: включить или отключить|protect|stage_ipv6"
 	"21|stage21_console|🖥|Локальный вход (консоль)|protect|stage_console"
+	"22|stage22_docker|🐳|Docker: установка и состояние|protect|stage_docker"
+	"23|stage23_autostart|🔄|Автозапуск: что стартует с системой|system|stage_autostart"
 )
 readonly CATEGORY_ORDER=(setup access protect system)
 
@@ -226,6 +228,93 @@ progress_bar() {
 	printf "${C_RESET}] %3d%%" "$pct"
 }
 
+# ── Показ выполняемых команд ─────────────────────────────────────────
+# Лучшая практика CLI-интерфейсов: человек должен видеть, что именно делает
+# скрипт, а не смотреть на мигающий курсор. Поэтому каждый шаг печатает себя
+# (и саму команду), крутит спиннер и оставляет на его месте результат со
+# временем. Полный вывод команды уходит в лог; в --verbose льётся и на экран.
+#
+# Почему не whiptail/dialog: это внешняя зависимость (newt), которого нет ни на
+# голом Alpine, ни в минимальном контейнере. Свой ANSI-интерфейс работает
+# везде, где есть bash и терминал.
+UI_VERBOSE=false
+UI_QUIET=false
+STEP_TOTAL=0
+STEP_NO=0
+STEP_OUT="" # вывод последнего шага (нужен вызывающему для диагностики)
+
+# Микросекунды для замера времени шага. EPOCHREALTIME есть в bash 5,
+# иначе считаем в секундах (обычно этого достаточно)
+_now_us() {
+	if [[ -n "${EPOCHREALTIME:-}" ]]; then printf '%s' "${EPOCHREALTIME/./}"; else printf '%s' "$((SECONDS * 1000000))"; fi
+}
+
+# steps_total N — сколько шагов будет в этапе, чтобы нумеровать «2 из 5».
+# Имя без префикса stage_: иначе тест «каждая stage_* есть в реестре» считал бы
+# эту утилиту этапом.
+steps_total() {
+	STEP_TOTAL="${1:-0}"
+	STEP_NO=0
+}
+
+# step_run "что делаем" команда [аргументы...] → 0 успех, 1 провал
+# При провале текст вывода остаётся в $STEP_OUT и печатаются последние строки.
+step_run() {
+	local desc="$1"
+	shift
+	STEP_NO=$((STEP_NO + 1))
+	# если шагов оказалось больше обещанного, лучше молчать, чем писать «4/3»
+	local counter=""
+	((STEP_TOTAL > 0 && STEP_NO <= STEP_TOTAL)) && counter="${STEP_NO}/${STEP_TOTAL} "
+
+	local t0 t1 rc=0 cmd=""
+	# %q сохраняет кавычки: строку можно скопировать и выполнить как есть,
+	# а «$*» от неё оставлял только слова без границ аргументов
+	local a
+	for a in "$@"; do cmd+="$(printf '%q ' "$a")"; done
+	cmd=${cmd% }
+	t0=$(_now_us)
+	if ! $UI_QUIET; then
+		printf '  %b%s%b%s\n' "$C_DIM" "$counter" "$desc" "$C_RESET"
+		printf '    %b$ %s%b\n' "$C_DIM" "$cmd" "$C_RESET"
+	fi
+
+	STEP_OUT=""
+	if $UI_VERBOSE; then
+		# живой вывод: удобно, когда что-то пошло не так и хочется видеть детали
+		"$@" 2>&1 | tee -a "$LOG_FILE"
+		rc=${PIPESTATUS[0]}
+	else
+		spinner_start "$desc"
+		STEP_OUT=$("$@" 2>&1)
+		rc=$?
+		spinner_stop
+		printf '%s\n' "${STEP_OUT:-}" >>"$LOG_FILE" 2>/dev/null || true
+	fi
+
+	t1=$(_now_us)
+	local ms=$(((t1 - t0) / 1000))
+	local tm
+	if ((ms >= 1000)); then tm="$((ms / 1000)).$(((ms % 1000) / 100))s"; else tm="${ms}ms"; fi
+
+	if ((rc == 0)); then
+		$UI_QUIET || printf '  %b%s%b %s %b(%s)%b\n' "$C_GREEN" "$ICON_OK" "$C_RESET" "$desc" "$C_DIM" "$tm" "$C_RESET"
+		return 0
+	fi
+
+	log_err "$desc — не получилось ($tm)"
+	if [[ -n "$STEP_OUT" ]]; then
+		local l
+		while IFS= read -r l; do printf '    %b%s%b\n' "$C_DIM" "$l" "$C_RESET"; done \
+			< <(printf '%s\n' "$STEP_OUT" | grep -v '^[[:space:]]*$' | tail -5)
+	fi
+	hint "полный вывод: $LOG_FILE"
+	return 1
+}
+
+# step_note "текст" — пояснение без команды (единый отступ со шагами)
+step_note() { $UI_QUIET || printf '  %b%s%b\n' "$C_DIM" "$1" "$C_RESET"; }
+
 # tee падает, если каталога/лога нет (например при source в тестах) — тогда только stdout
 log() {
 	if [[ -w "$LOG_FILE" || -w "${LOG_FILE%/*}" ]]; then
@@ -249,6 +338,17 @@ hr_thick() {
 	local line
 	printf -v line '%*s' "$TERM_WIDTH" ''
 	printf "${C_BLUE}%s${C_RESET}\n" "${line// /═}"
+}
+
+# Дополнить строку пробелами до ширины w ПО СИМВОЛАМ.
+# printf '%-20s' в bash считает ширину в БАЙТАХ (на musl/Alpine — даже с
+# LC_ALL=C.UTF-8), а кириллица занимает два байта на символ: колонки разъезжаются.
+# ${#var} считает символы, от них и считаем отступ.
+pad() {
+	local s="$1" w="$2" n
+	n=$((w - ${#s}))
+	((n > 0)) || n=0
+	printf '%s%*s' "$s" "$n" ''
 }
 
 # Обрезка строки по СИМВОЛАМ, а не байтам: без UTF-8 в locale bash режет
@@ -3453,7 +3553,7 @@ stage_bbr() {
 	echo -e "  ${C_BOLD}Текущее:${C_RESET}"
 	echo "    congestion control: $current_cc"
 	echo "    default qdisc:      $current_qdisc"
-	echo "    BBR модуль:         $($bbr_available && echo -e "${C_GREEN}доступен${C_RESET}" || echo -e "${C_RED}недоступен${C_RESET}")"
+	echo -e "    BBR модуль:         $($bbr_available && echo -e "${C_GREEN}доступен${C_RESET}" || echo -e "${C_RED}недоступен${C_RESET}")"
 	echo ""
 
 	if [[ "$current_cc" == "bbr" ]]; then
@@ -4421,6 +4521,447 @@ _ipv6_enable() {
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 23: АВТОЗАПУСК — ЧТО СТАРТУЕТ ВМЕСТЕ С СИСТЕМОЙ
+# ═══════════════════════════════════════════════════════════════════
+# Каждый включённый юнит — это служба, которая работает после перезагрузки.
+# Лишнее в автозапуске = лишняя поверхность атаки и лишняя память. Здесь видно
+# что включено и что выключено, и можно переключить конкретный пункт.
+#
+# systemd: список юнитов (enabled/disabled) и целевой target по умолчанию.
+# OpenRC: runlevels (default/boot) и rc-update.
+
+# Включённые в автозапуск юниты (по одному в строке)
+_autostart_enabled() {
+	if $HAS_SYSTEMD; then
+		systemctl list-unit-files --no-legend --plain --type=service --state=enabled 2>/dev/null |
+			awk '{print $1}' | sort
+	else
+		local lvl
+		for lvl in default boot; do
+			rc-update show "$lvl" 2>/dev/null | awk -v l="$lvl" '$2=="|" && $3==l {print $1}'
+		done | sort -u
+	fi
+}
+
+# Выключенные, но установленные юниты (кандидаты на включение)
+_autostart_disabled() {
+	if $HAS_SYSTEMD; then
+		systemctl list-unit-files --no-legend --plain --type=service --state=disabled 2>/dev/null |
+			awk '{print $1}' | sort
+	else
+		local d
+		for d in /etc/init.d/*; do
+			[[ -x "$d" ]] && basename "$d"
+		done | sort
+	fi
+}
+
+_autostart_level() {
+	if $HAS_SYSTEMD; then
+		printf 'target по умолчанию: %s' "$(systemctl get-default 2>/dev/null)"
+	else
+		printf 'уровень: default (rc-update add <служба> default)'
+	fi
+}
+
+# Порядковый выбор из списка: _pick_from "Заголовок" <список>
+# Печатает выбранное имя в stdout, возвращает 1 при отказе.
+_pick_from() {
+	local title="$1"
+	shift
+	local items=("$@") i=0 it
+	# ВАЖНО: меню печатаем в stderr, а наружу (в $()) уходит только выбранное
+	# имя — иначе pick=$(...) захватил бы весь текст меню вместе с результатом.
+	echo "" >&2
+	echo -e "${C_BOLD}▸ $title${C_RESET}" >&2
+	for it in "${items[@]}"; do
+		i=$((i + 1))
+		printf '  %b%3d)%b %s\n' "$C_DIM" "$i" "$C_RESET" "$it" >&2
+	done
+	echo -e "  ${C_BOLD}S)${C_RESET} Назад" >&2
+	echo "" >&2
+	local ans
+	read -rp "  ${ICON_ARROW} " ans
+	[[ "${ans,,}" == "s" || -z "$ans" ]] && return 1
+	[[ "$ans" =~ ^[0-9]+$ && $ans -ge 1 && $ans -le ${#items[@]} ]] || {
+		log_err "Нет такого номера"
+		return 1
+	}
+	printf '%s' "${items[$((ans - 1))]}"
+	return 0
+}
+
+stage_autostart() {
+	stage_banner "🔄" "23" "Автозапуск: что стартует с системой"
+
+	local -a enabled=()
+	while IFS= read -r l; do [[ -n "$l" ]] && enabled+=("$l"); done < <(_autostart_enabled)
+
+	echo -e "${C_BOLD}▸ Сейчас:${C_RESET}"
+	printf '  %s %s\n' "$(pad "Init:" 22)" "$INIT_SYSTEM ($(_autostart_level))"
+	printf '  %s %s\n' "$(pad "В автозапуске:" 22)" "${#enabled[@]} служб"
+	echo ""
+	if [[ ${#enabled[@]} -gt 0 ]]; then
+		echo -e "  ${C_BOLD}Включено:${C_RESET}"
+		printf '    %s\n' "${enabled[@]}" | head -25
+		[[ ${#enabled[@]} -gt 25 ]] && echo -e "    ${C_DIM}… всего ${#enabled[@]}${C_RESET}"
+	fi
+	echo ""
+	echo "  1) Показать полный список включённых"
+	echo "  2) Выключить из автозапуска"
+	echo "  3) Включить в автозапуск"
+	echo "  4) Найти службу в списке"
+	echo "  S) Назад"
+	echo ""
+	read -rp "  ${ICON_ARROW} " ac
+
+	case "$ac" in
+	1)
+		echo ""
+		printf '    %s\n' "${enabled[@]}" 2>/dev/null || echo -e "    ${C_DIM}пусто${C_RESET}"
+		echo ""
+		n=$(printf '%s\n' "${enabled[@]}" 2>/dev/null | grep -c . || true)
+		log_info "Всего в автозапуске: ${n:-0}"
+		read -rp "  Enter..." _
+		;;
+	2)
+		[[ ${#enabled[@]} -eq 0 ]] && {
+			log_warn "Автозапуск пуст"
+			return 0
+		}
+		local pick
+		pick=$(_pick_from "Выключить из автозапуска?" "${enabled[@]}") || return 0
+		echo ""
+		log_warn "Служба $pick останется установленной, но не будет стартовать сама"
+		hint "выключаем только автозапуск — уже запущенный процесс не тронем"
+		confirm "Выключить $pick из автозапуска?" || return 0
+		if step_run "Выключаю $pick из автозапуска" svc_disable "$pick"; then
+			log_ok "$pick больше не стартует сам"
+		else
+			log_warn "Не получилось — проверьте вручную: systemctl disable $pick"
+		fi
+		;;
+	3)
+		local -a disabled=()
+		while IFS= read -r l; do [[ -n "$l" ]] && disabled+=("$l"); done < <(_autostart_disabled)
+		# убираем то, что уже включено, чтобы список не путал
+		local -a only=() d
+		for d in "${disabled[@]}"; do
+			[[ " ${enabled[*]} " == *" $d "* ]] && continue
+			only+=("$d")
+		done
+		[[ ${#only[@]} -eq 0 ]] && {
+			log_info "Все установленные службы уже в автозапуске"
+			return 0
+		}
+		local pick
+		pick=$(_pick_from "Включить в автозапуск (первые 30)" "${only[@]:0:30}") || return 0
+		if step_run "Включаю $pick в автозапуск" svc_enable "$pick"; then
+			log_ok "$pick будет стартовать вместе с системой"
+			hint "запустить сейчас: systemctl start $pick"
+		else
+			log_warn "Не получилось — проверьте вручную: systemctl enable $pick"
+		fi
+		;;
+	4)
+		read -rp "  Часть имени: " q
+		[[ -n "$q" ]] || return 0
+		echo ""
+		echo -e "${C_BOLD}▸ Совпадения:${C_RESET}"
+		if $HAS_SYSTEMD; then
+			systemctl list-unit-files --no-legend --plain --type=service 2>/dev/null |
+				grep -i -- "$q" | awk '{printf "    %-45s %s\n", $1, $2}'
+		else
+			rc-update show 2>/dev/null | grep -i -- "$q" | sed 's/^/    /'
+		fi
+		echo ""
+		read -rp "  Enter..." _
+		;;
+	*) log_info "Пропущено" ;;
+	esac
+
+	update_stage_status "stage23_autostart" "completed"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ЭТАП 22: DOCKER — УСТАНОВКА И СОСТОЯНИЕ
+# ═══════════════════════════════════════════════════════════════════
+# Ставим официальный Docker Engine по инструкции
+# https://docs.docker.com/engine/install/ubuntu/#install-using-the-repository
+# (Debian — та же схема с /linux/debian, RHEL-семейство — repo-файл + dnf,
+# Alpine — свой docker из apk). Репозиторий, а не docker.io из дистрибутива:
+# там версия старее и обновляется медленно.
+#
+# Про фаервол помним: опубликованные порты контейнеров обходят правила UFW
+# через цепочку DOCKER-USER — этап 7 об этом предупреждает.
+
+_docker_state() {
+	# short | running | stopped | absent
+	if ! command -v docker &>/dev/null; then
+		echo absent
+		return
+	fi
+	if svc_is_active docker; then
+		# служба может быть жива, а демон не отвечать — проверяем фактом
+		docker info &>/dev/null && echo running || echo stopped
+	else
+		echo stopped
+	fi
+}
+
+_docker_report() {
+	local st ver
+	st=$(_docker_state)
+	case "$st" in
+	absent)
+		echo -e "  ${C_DIM}Docker не установлен${C_RESET}"
+		return 0
+		;;
+	running) ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null) ;;
+	*) ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) ;;
+	esac
+	printf '  %s %s\n' "$(pad "Docker Engine:" 22)" "${ver:-?}"
+	case "$st" in
+	running) printf '  %s %s\n' "$(pad "Служба:" 22)" "запущена (docker)" ;;
+	stopped) printf '  %s %s\n' "$(pad "Служба:" 22)" "НЕ запущена" ;;
+	esac
+	if [[ "$st" == running ]]; then
+		local n_cont n_img
+		n_cont=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+		n_img=$(docker images -q 2>/dev/null | wc -l | tr -d ' ')
+		printf '  %s %s (всего запущено; образов: %s)\n' "$(pad "Контейнеры:" 22)" "$n_cont" "$n_img"
+		printf '  %s %s\n' "$(pad "Автозапуск:" 22)" "$(svc_is_enabled docker && echo "включён" || echo "выключен")"
+	fi
+	if command -v docker compose &>/dev/null || docker compose version &>/dev/null; then
+		printf '  %s %s\n' "$(pad "Compose (plugin):" 22)" "$(docker compose version --short 2>/dev/null || echo есть)"
+	fi
+	if [[ "$st" != absent ]] && ! docker info &>/dev/null; then
+		hint "демон не отвечает: чаще всего служба не запущена или нет прав у пользователя"
+	fi
+}
+
+# Список поддерживаемых кодовых имён Docker для этого дистрибутива лежит в
+# его репозитории; проверять его угадыванием не будем — просто ставим репо и
+# смотрим, нашёлся ли в нём docker-ce. Если нет — откатываем свои файлы.
+_docker_install_apt() {
+	local codename arch repo_url
+	codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+	arch=$(dpkg --print-architecture)
+	case "$ID" in
+	ubuntu | linuxmint | pop) repo_url="https://download.docker.com/linux/ubuntu" ;;
+	debian | raspbian) repo_url="https://download.docker.com/linux/debian" ;;
+	*) repo_url="https://download.docker.com/linux/${ID}" ;;
+	esac
+	[[ -n "$codename" ]] || {
+		log_err "Не удалось определить кодовое имя дистрибутива (VERSION_CODENAME отсутствует)"
+		return 1
+	}
+
+	step_run "Ставлю пакеты для ключа и репозитория" \
+		apt-get install -y ca-certificates curl || return 1
+	step_run "Ключ Docker (docker.asc)" bash -c "
+		install -m 0755 -d /etc/apt/keyrings &&
+		curl -fsSL '$repo_url/gpg' -o /etc/apt/keyrings/docker.asc &&
+		chmod a+r /etc/apt/keyrings/docker.asc" || return 1
+
+	# формат deb822 (docker.sources) — как в текущей инструкции Docker
+	backup_file "/etc/apt/sources.list.d/docker.sources" "stage22_docker"
+	{
+		echo "Types: deb"
+		echo "URIs: $repo_url"
+		echo "Suites: $codename"
+		echo "Components: stable"
+		echo "Architectures: $arch"
+		echo "Signed-By: /etc/apt/keyrings/docker.asc"
+	} >/etc/apt/sources.list.d/docker.sources
+	# чистим старый однострочный формат, если остался от прежних установок
+	[[ -f /etc/apt/sources.list.d/docker.list ]] && {
+		backup_file "/etc/apt/sources.list.d/docker.list" "stage22_docker"
+		rm -f /etc/apt/sources.list.d/docker.list
+	}
+
+	step_run "Обновляю индекс пакетов с репозиторием Docker" apt-get update || {
+		log_err "Репозиторий Docker не принят apt — файл sources удаляю, чтобы не ломать обновления"
+		rm -f /etc/apt/sources.list.d/docker.sources
+		hint "проверьте кодовое имя '$codename' в $repo_url/dists/"
+		return 1
+	}
+	step_run "Устанавливаю Docker Engine, CLI, containerd, buildx и compose" \
+		apt-get install -y docker-ce docker-ce-cli containerd.io \
+		docker-buildx-plugin docker-compose-plugin || return 1
+}
+
+_docker_install_dnf() {
+	step_run "Добавляю репозиторий Docker" \
+		"$PKG_MGR" config-manager --add-repo \
+		"https://download.docker.com/linux/centos/docker-ce.repo" || return 1
+	step_run "Устанавливаю Docker Engine и плагины" \
+		"$PKG_MGR" install -y docker-ce docker-ce-cli containerd.io \
+		docker-buildx-plugin docker-compose-plugin || return 1
+}
+
+_docker_install_apk() {
+	# на Alpine Docker — обычный пакет; docker-openrc даёт init-скрипт.
+	# Код возврата apk ненадёжен (отдаёт 1 и при успешной установке), поэтому
+	# успех проверяем по факту — как в pkg_install_retry.
+	if ! step_run "Устанавливаю docker из apk" apk add --no-cache docker docker-cli-compose; then
+		_apk_all_installed docker docker-cli-compose || return 1
+		log_info "пакеты docker установлены (apk пожаловался только на владельцев файлов)"
+	fi
+	pkg_install_retry docker-openrc || true
+	step_run "Включаю автозапуск и запускаю docker" bash -c \
+		"rc-update add docker default >/dev/null 2>&1; rc-service docker start >/dev/null 2>&1" || true
+}
+
+_docker_install() {
+	echo ""
+	log_warn "Docker ставится из официального репозитория (не docker.io из дистрибутива)"
+	log_info "  так версия свежее и обновляется вместе с системой"
+	echo ""
+	# Пакеты-конкуренты из дистрибутива конфликтуют с официальными
+	local conflict=() p
+	for p in docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc; do
+		if [[ "$PKG_MGR" == apt ]]; then
+			dpkg -s "$p" &>/dev/null && conflict+=("$p")
+		elif [[ "$PKG_MGR" == apk ]]; then
+			apk info -e "$p" &>/dev/null && conflict+=("$p")
+		else
+			rpm -q "$p" &>/dev/null && conflict+=("$p")
+		fi
+	done
+	if [[ ${#conflict[@]} -gt 0 ]]; then
+		log_warn "Установлены несовместимые пакеты: ${conflict[*]}"
+		hint "они конфликтуют с официальным Docker и должны быть удалены"
+		confirm "Удалить их и продолжить?" || {
+			log_info "Отменено"
+			return 1
+		}
+		pkg_remove "${conflict[@]}" || log_warn "Часть пакетов удалить не удалось"
+	fi
+
+	steps_total 4
+	case "$PKG_MGR" in
+	apt) _docker_install_apt || return 1 ;;
+	dnf | yum) _docker_install_dnf || return 1 ;;
+	apk) _docker_install_apk || return 1 ;;
+	esac
+
+	step_run "Включаю автозапуск и запускаю службу docker" bash -c \
+		"$([[ $HAS_SYSTEMD == true ]] && echo 'systemctl enable --now docker' || echo 'rc-update add docker default >/dev/null 2>&1; rc-service docker start >/dev/null 2>&1')" || true
+	svc_is_enabled docker || svc_enable docker || true
+
+	# Проверка состояния — это и есть «проверка Docker» из инструкции
+	if svc_is_active docker && docker info &>/dev/null; then
+		log_ok "Docker установлен и запущен ($(docker --version 2>/dev/null))"
+	else
+		log_err "Docker установлен, но демон не отвечает"
+		hint "смотрите: systemctl status docker  (или rc-service docker status)"
+		update_stage_status "stage22_docker" "failed"
+		return 1
+	fi
+	if confirm "Проверить работу контейнером hello-world (нужна сеть)?"; then
+		if step_run "Запускаю hello-world" docker run --rm hello-world; then
+			log_ok "Docker работает: контейнер запустился"
+		else
+			log_warn "hello-world не прошёл — проверьте сеть и настройки демона"
+		fi
+	fi
+	log_warn "Помните: опубликованные порты контейнеров обходят правила UFW (этап 7)"
+	update_stage_status "stage22_docker" "completed"
+	return 0
+}
+
+_docker_remove() {
+	local st
+	st=$(_docker_state)
+	[[ "$st" == absent ]] && {
+		log_info "Docker не установлен"
+		return 0
+	}
+	echo ""
+	log_warn "Удаление Docker остановит все контейнеры и снимет автозапуск"
+	hint "образы, контейнеры и тома в /var/lib/docker останутся на диске"
+	confirm "Удалить Docker?" || {
+		log_info "Отменено"
+		return 1
+	}
+	svc_disable_now docker || true
+	case "$PKG_MGR" in
+	apt)
+		pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
+			docker-compose-plugin docker-ce-rootless-extras || true
+		;;
+	dnf | yum) pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true ;;
+	apk) pkg_remove docker docker-cli-compose docker-openrc || true ;;
+	esac
+	log_ok "Docker удалён"
+	if confirm "Удалить ещё и данные (/var/lib/docker, /var/lib/containerd)?"; then
+		rm -rf /var/lib/docker /var/lib/containerd && log_ok "Данные Docker удалены"
+	fi
+	log_info "Файлы репозитория остались: /etc/apt/sources.list.d/docker.sources и ключ"
+	update_stage_status "stage22_docker" "skipped"
+	return 0
+}
+
+stage_docker() {
+	stage_banner "🐳" "22" "Docker: установка и состояние"
+
+	echo -e "${C_BOLD}▸ Сейчас:${C_RESET}"
+	_docker_report
+	echo ""
+	echo "  1) Установить Docker (официальный репозиторий)"
+	echo "  2) Проверить состояние"
+	echo "  3) Обновить Docker"
+	echo "  4) Удалить Docker"
+	echo "  S) Назад"
+	echo ""
+	read -rp "  ${ICON_ARROW} " dk
+
+	case "$dk" in
+	1)
+		if [[ "$(_docker_state)" != absent ]]; then
+			log_info "Docker уже установлен — состояние выше"
+			log_info "  обновить: пункт 3, переустановить: сначала пункт 4"
+			return 0
+		fi
+		_docker_install
+		;;
+	2)
+		echo ""
+		_docker_report
+		if [[ "$(_docker_state)" == running ]]; then
+			echo ""
+			echo -e "${C_BOLD}▸ Контейнеры:${C_RESET}"
+			docker ps --format '  {{.Names}}  {{.Image}}  {{.Status}}  {{.Ports}}' 2>/dev/null | head -15
+			echo -e "${C_BOLD}▸ Занято на диске:${C_RESET}"
+			docker system df 2>/dev/null | sed 's/^/  /'
+		fi
+		echo ""
+		read -rp "  Enter..." _
+		;;
+	3)
+		[[ "$(_docker_state)" == absent ]] && {
+			log_err "Docker не установлен"
+			return 1
+		}
+		case "$PKG_MGR" in
+		apt)
+			step_run "Обновляю списки пакетов" apt-get update || true
+			step_run "Обновляю Docker" apt-get install -y --only-upgrade \
+				docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+			;;
+		dnf | yum) step_run "Обновляю Docker" "$PKG_MGR" update -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin ;;
+		apk) step_run "Обновляю Docker" apk -U upgrade --available docker docker-cli-compose ;;
+		esac
+		svc_restart docker || true
+		log_ok "Обновление завершено"
+		;;
+	4) _docker_remove ;;
+	*) log_info "Пропущено" ;;
+	esac
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  ЭТАП 21: ЛОКАЛЬНЫЙ ВХОД (КОНСОЛЬ ПРОВАЙДЕРА)
 # ═══════════════════════════════════════════════════════════════════
 # У VPS кроме SSH есть «внутренняя консоль»: VNC/веб-терминал у провайдера
@@ -4665,16 +5206,16 @@ _console_report() {
 	virt=$(_virt_type)
 	getty=$(_console_getty_state)
 	root_state=$(_console_root_state)
-	printf '  %-20s %s\n' "Виртуализация:" "$(_virt_title "$virt")"
+	printf '  %s %s\n' "$(pad "Виртуализация:" 20)" "$(_virt_title "$virt")"
 	if [[ -n "$getty" ]]; then
-		printf '  %-20s %s\n' "Локальный вход:" "$getty"
+		printf '  %s %s\n' "$(pad "Локальный вход:" 20)" "$getty"
 	else
-		printf '  %-20s %s\n' "Локальный вход:" "закрыт (вход только по SSH)"
+		printf '  %s %s\n' "$(pad "Локальный вход:" 20)" "закрыт (вход только по SSH)"
 	fi
 	case "$root_state" in
-	allowed) printf '  %-20s %s\n' "root на консоли:" "разрешён" ;;
-	denied) printf '  %-20s %s\n' "root на консоли:" "запрещён" ;;
-	*) printf '  %-20s %s\n' "root на консоли:" "не проверяется (нет pam_securetty)" ;;
+	allowed) printf '  %s %s\n' "$(pad "root на консоли:" 20)" "разрешён" ;;
+	denied) printf '  %s %s\n' "$(pad "root на консоли:" 20)" "запрещён" ;;
+	*) printf '  %s %s\n' "$(pad "root на консоли:" 20)" "не проверяется (нет pam_securetty)" ;;
 	esac
 }
 
@@ -4829,6 +5370,10 @@ stage_rollback() {
 			jail.local) op="/etc/fail2ban/jail.local" ;;
 			99-seq-vps.rules) op="/etc/audit/rules.d/99-seq-vps.rules" ;;
 			esac
+			;;
+		stage22_docker)
+			[[ "$bn" == "docker.sources" ]] && op="/etc/apt/sources.list.d/docker.sources"
+			[[ "$bn" == "docker.list" ]] && op="/etc/apt/sources.list.d/docker.list"
 			;;
 		stage21_console)
 			# маски systemd — не файлы: их снимает _console_enable после копирования
@@ -4998,7 +5543,7 @@ _show_conf_file() {
 
 # Одна строка «параметр: значение» для быстрых проверок
 _show_kv() {
-	printf "    %-38s %b%s%b\n" "$1" "${3:-}" "$2" "$C_RESET"
+	printf "    %s %b%s%b\n" "$(pad "$1" 38)" "${3:-}" "$2" "$C_RESET"
 }
 
 show_profiles() {
@@ -5554,6 +6099,8 @@ show_help() {
 	echo ""
 	echo "  Использование:"
 	echo "    sudo ./4script.sh                     — интерактивное меню на этом сервере"
+	echo "    sudo ./4script.sh --verbose           — показывать вывод команд на экране"
+	echo "    sudo ./4script.sh --quiet             — только ошибки"
 	echo "    bash ./4script.sh --remote user@host  — настроить УДАЛЁННЫЙ сервер отсюда"
 	echo "    sudo ./4script.sh --help              — эта справка"
 	echo "    bash ./4script.sh --remote-help       — справка по удалённому режиму"
@@ -5584,6 +6131,16 @@ main() {
 		case "$1" in
 		-h | --help)
 			show_help
+			;;
+		-v | --verbose)
+			# показывать вывод команд прямо на экране, а не только в логе
+			UI_VERBOSE=true
+			shift
+			;;
+		-q | --quiet)
+			# только ошибки: удобно для запуска из другого скрипта
+			UI_QUIET=true
+			shift
 			;;
 		--remote | -r)
 			remote_spec="${2:-}"

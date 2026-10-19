@@ -24,6 +24,11 @@ wget -qO 4script.sh https://raw.githubusercontent.com/Fluttershy174PUNK/4Script/
 bash 4script.sh --remote root@YOUR_SERVER
 ```
 
+`--verbose` streams the output of every command it runs; `--quiet` leaves only
+errors. By default each step prints what it does and the command it runs, then
+leaves a green check with the time it took — so you can see what is going on
+instead of watching a cursor.
+
 The password is asked **once**, to install your SSH key; after that everything
 runs over the key. The setup itself runs inside `screen` on the server, so a
 dropped connection or a sleeping laptop does not kill it halfway.
@@ -92,6 +97,7 @@ Stages are grouped; each one can be run alone, and status is remembered in
 | 19 | Event audit | `auditd` with baseline rules: identity files, `sudoers`, SSH config, root commands, kernel modules |
 | 20 | IPv6 | turn IPv6 on or off (survives reboot, detects an IPv6 SSH session before cutting it) |
 | 21 | Local login (console) | close the provider's console: virtual ttys and the serial port, plus root on the console — SSH stays the only way in, with a one-key way back |
+| 22 | Docker | install Docker Engine from the official repository (not `docker.io`), verify the daemon, update or remove it |
 |  | **System and network** |  |
 | 11 | Fish shell | install fish |
 | 12 | Time | timezone + NTP |
@@ -100,6 +106,7 @@ Stages are grouped; each one can be run alone, and status is remembered in
 | 15 | BBR | TCP congestion control |
 | 16 | Kernel hardening | sysctl: KASLR/dmesg/core dumps, hardlink/symlink guards, ICMP redirects, rp_filter, SYN cookies |
 | 17 | Audit | listen ports, accounts (UID 0, no password, sudo), SUID/SGID, world-writable files, LSM state (read-only) |
+| 23 | Autostart | what starts with the system: list enabled units and switch a single one on or off |
 | R | Rollback | restore a stage from its backup |
 | P | Profiles | show what settings are actually in effect right now |
 | H | Help | stage list and recommended order |
