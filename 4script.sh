@@ -3873,6 +3873,17 @@ _pam_pwquality_active() {
 	grep -qE '^[^#]*pam_pwquality\.so' "$PAM_PASSWORD_FILE" 2>/dev/null
 }
 
+# pam modules can be in /lib/security, /lib/<triplet>/security, or /usr/lib/<triplet>/security.
+# `ls existing missing` still returns failure, so use -f over candidates instead.
+_pam_pwquality_module_available() {
+	local f
+	for f in /lib/security/pam_pwquality.so /lib/*/security/pam_pwquality.so \
+		/usr/lib/security/pam_pwquality.so /usr/lib/*/security/pam_pwquality.so; do
+		[[ -f "$f" ]] && return 0
+	done
+	return 1
+}
+
 # Проверка, что изменение PAM не сломало аутентификацию:
 # pam_faillock/pwquality должны хотя бы загружаться
 _pam_sanity() {
@@ -3919,7 +3930,7 @@ stage_pam() {
 	echo -e "${C_BOLD}▸ Текущее состояние:${C_RESET}"
 	$fl && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_faillock: включён (блокировка учётки после неудач)" ||
 		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_faillock: выключен"
-	if command -v pam_pwquality.so >/dev/null 2>&1 || ls /usr/lib/*/security/pam_pwquality.so &>/dev/null; then
+	if _pam_pwquality_module_available; then
 		$pq && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_pwquality: включён" ||
 			echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_pwquality: выключен"
 	else
@@ -3941,13 +3952,18 @@ stage_pam() {
 	echo "  S) Назад"
 	read -rp "  ${ICON_ARROW} " choice
 
+	local rc=0
 	case "$choice" in
-	1) _pam_enable_faillock ;;
-	2) _pam_enable_pwquality ;;
-	3) _pam_disable_faillock ;;
+	1) _pam_enable_faillock || rc=$? ;;
+	2) _pam_enable_pwquality || rc=$? ;;
+	3) _pam_disable_faillock || rc=$? ;;
 	*) log_info "Пропущено" ;;
 	esac
 
+	if ((rc != 0)); then
+		update_stage_status "stage18_pam" "failed"
+		return "$rc"
+	fi
 	update_stage_status "stage18_pam" "completed"
 }
 
@@ -3965,18 +3981,132 @@ _pam_file_names() {
 	fi
 }
 
-# prepend-строка в common-auth: pam_faillock должен считаться ДО pam_unix
+# Установить faillock вокруг ровно одного pam_unix в стандартном auth-стеке.
+# pam_faillock требует preauth ДО проверки пароля, authfail ПОСЛЕ неё, authsucc
+# при успехе. authfail перед pam_unix ломает ВСЕ входы — включая правильный
+# пароль. Контроль [success=1 default=bad] пропускает authfail при успехе и
+# передаёт неудачу в него; authsucc очищает счётчик после валидного пароля.
+# Неизвестный/нестандартный стек (в т.ч. auth-модуль перед pam_unix) не угадываем.
+_pam_apply_faillock_auth() {
+	local file="$1" tmp out rc
+	[[ -f "$file" ]] || return 1
+	if grep -qE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so' "$file" &&
+		! grep -qF "# $OWN_MARK_PAM " "$file"; then
+		log_err "В $file уже есть сторонний pam_faillock — не меняю стек наугад"
+		return 2
+	fi
+	tmp=$(mktemp) && out=$(mktemp) || return 1
+	awk -v marker="$OWN_MARK_PAM" '
+	function emit_unix(line) {
+		print "# " marker " preauth"
+		print "auth required pam_faillock.so preauth silent"
+		print "# " marker " original-pam-unix: " line
+		if (line ~ /^[[:space:]]*auth[[:space:]]+\[[^]]+\]/) {
+			sub(/\[[^]]+\]/, "[success=1 default=bad]", line)
+		} else if (line ~ /^[[:space:]]*auth[[:space:]]+(required|requisite|sufficient|optional)[[:space:]]+/) {
+			sub(/^[[:space:]]*auth[[:space:]]+(required|requisite|sufficient|optional)[[:space:]]+/, "auth [success=1 default=bad] ", line)
+		} else {
+			bad_control=1
+			return
+		}
+		print line
+		print "# " marker " authfail"
+		print "auth [default=die] pam_faillock.so authfail"
+		print "# " marker " authsucc"
+		print "auth sufficient pam_faillock.so authsucc"
+	}
+	BEGIN { original_prefix="# " marker " original-pam-unix: " }
+	{
+		if (index($0, original_prefix) == 1) {
+			original=substr($0, length(original_prefix)+1)
+			next
+		}
+		if (index($0, "# " marker " ") == 1) next
+		if ($0 ~ /^[[:space:]]*auth[[:space:]].*pam_faillock\.so/) next
+		if ($0 ~ /^[[:space:]]*auth[[:space:]].*pam_unix\.so([[:space:]]|$)/) {
+			count++
+			if (count > 1 || auth_before_unix) bad_order=1
+			line=$0
+			if (original != "") { line=original; original="" }
+			emit_unix(line)
+			next
+		}
+		if ($0 ~ /^[[:space:]]*auth[[:space:]]/ && count == 0) auth_before_unix=1
+		print
+	}
+	END {
+		if (count != 1 || original != "" || bad_control || bad_order || auth_before_unix) exit 1
+	}
+	' "$file" >"$out"
+	rc=$?
+	if ((rc != 0)); then
+		rm -f "$tmp" "$out"
+		log_err "Не удалось безопасно разместить faillock: нужен один pam_unix без предшествующих auth-модулей в $file"
+		return 1
+	fi
+	# Новый файл не должен менять права существующего PAM-конфига.
+	cat "$out" >"$tmp" && cat "$tmp" >"$file"
+	rc=$?
+	rm -f "$tmp" "$out"
+	return "$rc"
+}
+
+_pam_remove_faillock_auth() {
+	local file="$1" tmp out
+	[[ -f "$file" ]] || return 0
+	if grep -qE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so' "$file" &&
+		! grep -qF "# $OWN_MARK_PAM " "$file"; then
+		log_err "В $file есть сторонний pam_faillock — не удаляю его"
+		return 1
+	fi
+	tmp=$(mktemp) && out=$(mktemp) || return 1
+	awk -v marker="$OWN_MARK_PAM" '
+	BEGIN { prefix="# " marker " original-pam-unix: " }
+	{
+		if (index($0,prefix)==1) { original=substr($0,length(prefix)+1); next }
+		if (index($0,"# " marker " ")==1) next
+		if ($0 ~ /^[[:space:]]*auth[[:space:]].*pam_faillock\.so/) next
+		if (original!="" && $0 ~ /^[[:space:]]*auth[[:space:]].*pam_unix\.so([[:space:]]|$)/) {
+			print original
+			original=""
+			next
+		}
+		print
+	}
+	END { if (original!="") exit 1 }
+	' "$file" >"$out"
+	if (($? != 0)); then
+		rm -f "$tmp" "$out"
+		log_err "Не удалось восстановить исходную строку pam_unix в $file"
+		return 1
+	fi
+	cat "$out" >"$tmp" && cat "$tmp" >"$file"
+	local rc=$?
+	rm -f "$tmp" "$out"
+	return "$rc"
+}
+
 _pam_enable_faillock() {
 	local deny="${1:-5}" unlock="${2:-900}"
 	_pam_file_names
 
-	if _pam_faillock_active; then
-		log_info "pam_faillock уже включён — обновляю лимиты"
-	else
-		backup_file "$PAM_AUTH_FILE" "stage18_pam"
-	fi
+	backup_file "$PAM_AUTH_FILE" "stage18_pam"
 	backup_file "$PAM_ACCOUNT_FILE" "stage18_pam"
 	backup_file "/etc/security/faillock.conf" "stage18_pam"
+
+	# Сначала проверяем и устанавливаем правильный auth-порядок; если стек не
+	# распознан, политику ещё не меняли и безопасно остановиться.
+	if ! _pam_apply_faillock_auth "$PAM_AUTH_FILE"; then
+		local auth_backup
+		auth_backup="${BACKUP_DIR}/stage18_pam/$(basename "$PAM_AUTH_FILE")"
+		[[ -f "$auth_backup" ]] && cp -a "$auth_backup" "$PAM_AUTH_FILE"
+		update_stage_status "stage18_pam" "failed"
+		return 1
+	fi
+	# account-вызов прежней версии мог остаться; удаляем только свой.
+	if grep -qF "$OWN_MARK_PAM account" "$PAM_ACCOUNT_FILE" 2>/dev/null; then
+		sed -i "/pam_faillock\\.so/d; /$OWN_MARK_PAM/d" "$PAM_ACCOUNT_FILE"
+	fi
 
 	# Политика
 	if [[ ! -f /etc/security/faillock.conf ]]; then
@@ -3992,31 +4122,6 @@ _pam_enable_faillock() {
 		echo "unlock_time = $unlock"
 		echo "$OWN_MARK: конец блока"
 	} >>/etc/security/faillock.conf
-
-	# auth: preauth + authfail вокруг pam_unix
-	# account: счётчик ведётся при входе (строка preauth в account)
-	if ! grep -q "$OWN_MARK_PAM preauth" "$PAM_AUTH_FILE" 2>/dev/null; then
-		local tmp
-		tmp=$(mktemp)
-		{
-			echo "$OWN_MARK faillock preauth (проверка блокировки до пароля)"
-			echo "auth	required			pam_faillock.so preauth"
-			echo "$OWN_MARK faillock authfail (счетчик неудач)"
-			echo "auth	[default=die]		pam_faillock.so authfail"
-		} >"$tmp"
-		cat "$PAM_AUTH_FILE" >>"$tmp"
-		mv "$tmp" "$PAM_AUTH_FILE"
-	fi
-	if ! grep -q "$OWN_MARK_PAM account" "$PAM_ACCOUNT_FILE" 2>/dev/null; then
-		local tmp
-		tmp=$(mktemp)
-		{
-			echo "$OWN_MARK faillock account (счётчик неудач при входе)"
-			echo "account	required		pam_faillock.so"
-		} >"$tmp"
-		cat "$PAM_ACCOUNT_FILE" >>"$tmp"
-		mv "$tmp" "$PAM_ACCOUNT_FILE"
-	fi
 
 	if ! _pam_sanity; then
 		log_err "PAM повреждён — восстанавливаю из бэкапа"
@@ -4038,14 +4143,24 @@ _pam_disable_faillock() {
 	_pam_file_names
 	backup_file "$PAM_AUTH_FILE" "stage18_pam"
 	backup_file "$PAM_ACCOUNT_FILE" "stage18_pam"
-	sed -i "/pam_faillock\.so/d; /$OWN_MARK_PAM/d" "$PAM_AUTH_FILE" "$PAM_ACCOUNT_FILE"
+	_pam_remove_faillock_auth "$PAM_AUTH_FILE" || return 1
+	# Мигрируем собственную account-строку прежней версии; сторонние строки не трогаем.
+	if grep -qF "$OWN_MARK_PAM account" "$PAM_ACCOUNT_FILE" 2>/dev/null; then
+		sed -i "/pam_faillock\\.so/d; /$OWN_MARK_PAM/d" "$PAM_ACCOUNT_FILE"
+	fi
 	log_ok "pam_faillock выключен (счётчики в /var/run/faillock можно удалить)"
 }
 
 _pam_enable_pwquality() {
 	_pam_file_names
+	# ВАЖНО: сохранить common-password ДО установки пакета. На Debian postinst
+	# libpam-pwquality вызывает pam-auth-update и сам включает модуль в стек.
+	# Если бэкапить после apt install, откат будет считать модуль «исходным».
+	backup_file "$PAM_PASSWORD_FILE" "stage18_pam"
+	backup_file "/etc/security/pwquality.conf" "stage18_pam"
+
 	# путь к модулю тоже разный: Debian — /usr/lib/<triplet>/security, Alpine — /lib/security
-	if ! ls /usr/lib/*/security/pam_pwquality.so /lib/security/pam_pwquality.so &>/dev/null; then
+	if ! _pam_pwquality_module_available; then
 		if [[ "$PKG_MGR" == apk ]]; then
 			log_info "Устанавливаю libpwquality..."
 			pkg_install_retry "libpwquality" || {
@@ -4055,25 +4170,33 @@ _pam_enable_pwquality() {
 		else
 			log_info "Устанавливаю libpam-pwquality..."
 			pkg_install_retry "libpam-pwquality" || {
-				log_err "Пакет libpam-pwquality недоступен"
+				local snap
+				snap="${BACKUP_DIR}/stage18_pam/$(basename "$PAM_PASSWORD_FILE")"
+				[[ -f "$snap" ]] && cp -a "$snap" "$PAM_PASSWORD_FILE"
+				log_err "Пакет libpam-pwquality недоступен; PAM-файл восстановлен"
 				return 1
 			}
 		fi
 	fi
-	backup_file "$PAM_PASSWORD_FILE" "stage18_pam"
-	backup_file "/etc/security/pwquality.conf" "stage18_pam"
 
-	# pam_pwquality вызывается из pam_unix через „nullok“ — проще включить
-	# отдельной строкой перед pam_unix и задать политику в pwquality.conf.
+	# Debian-пакет управляет модулем через штатный профиль pam-auth-update.
+	# Он уже включён postinst'ом при обычной установке; если профиль есть,
+	# просим включить его штатно, не форсируя перезапись локальных изменений.
+	if [[ "$PKG_MGR" == apt ]] && ! _pam_pwquality_active && command -v pam-auth-update &>/dev/null; then
+		DEBIAN_FRONTEND=noninteractive pam-auth-update --enable pwquality &>>"$LOG_FILE" || true
+	fi
+
+	# Alpine (и нестандартный Debian без профиля): явная строка перед pam_unix.
 	if ! _pam_pwquality_active; then
 		local tmp
 		tmp=$(mktemp)
 		{
 			echo "$OWN_MARK pwquality"
-			echo "password	requisite		pam_pwquality.so retry=3"
+			echo "password\trequisite\t\tpam_pwquality.so retry=3"
 		} >"$tmp"
 		cat "$PAM_PASSWORD_FILE" >>"$tmp"
-		mv "$tmp" "$PAM_PASSWORD_FILE"
+		cat "$tmp" >"$PAM_PASSWORD_FILE"
+		rm -f "$tmp"
 	fi
 
 	if [[ ! -f /etc/security/pwquality.conf ]]; then : >/etc/security/pwquality.conf; fi
@@ -4136,7 +4259,7 @@ _stage_pam_apk() {
 	echo -e "${C_BOLD}▸ Текущее состояние:${C_RESET}"
 	$fl && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_faillock: включён" ||
 		echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_faillock: выключен"
-	if ls /lib/security/pam_pwquality.so &>/dev/null; then
+	if _pam_pwquality_module_available; then
 		$pq && echo -e "  ${C_GREEN}${ICON_OK}${C_RESET}  pam_pwquality: включён" ||
 			echo -e "  ${C_YELLOW}${ICON_WARN}${C_RESET}  pam_pwquality: выключен"
 	else

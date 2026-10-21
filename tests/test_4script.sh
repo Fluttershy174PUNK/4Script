@@ -101,10 +101,10 @@ for def in "${SYSCTL_HARDENING[@]}"; do
 	[[ "$want" =~ ^[0-9]+$ ]] || fail "sysctl value is not numeric: $want"
 done
 
-# PAM-помощники существуют (этап 18). Сами функции не вызываем:
-# под set -e ненулевой код grep упал бы и без ошибки в коде.
-for fn in _pam_faillock_active _pam_pwquality_active _pam_sanity _pam_restore \
-	_pam_enable_faillock _pam_enable_pwquality _pam_disable_faillock; do
+# PAM-помощники: стековая трансформация тестируется только на временных файлах,
+# живые /etc/pam.d тест suite никогда не меняет.
+for fn in _pam_faillock_active _pam_pwquality_active _pam_pwquality_module_available _pam_sanity _pam_restore \
+	_pam_apply_faillock_auth _pam_remove_faillock_auth _pam_enable_faillock _pam_enable_pwquality _pam_disable_faillock; do
 	declare -F "$fn" >/dev/null || fail "missing PAM helper: $fn"
 done
 
@@ -276,6 +276,71 @@ grep -qF 'sed -i "s|^${_CONSOLE_MARK}||"' 4script.sh ||
 # литерал «\n» в printf склеивает файл в одну строку — уже случалось
 bad=$(grep -nE "printf '[^']*\\\\\\\\n" 4script.sh || true)
 [[ -z "$bad" ]] || fail "printf with a doubled backslash prints literal \\n: $bad"
+
+# ── PAM: faillock должен оборачивать pam_unix, не стоять до него ─────
+for fn in _pam_apply_faillock_auth _pam_remove_faillock_auth; do
+	declare -F "$fn" >/dev/null || fail "missing PAM stack helper: $fn"
+done
+pamdir=$(mktemp -d)
+pamfile="$pamdir/common-auth"
+printf '# baseline\nauth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\n' >"$pamfile"
+cp "$pamfile" "$pamdir/original"
+_pam_apply_faillock_auth "$pamfile" || fail 'faillock refused a normal pam_unix auth stack'
+pre=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so preauth' "$pamfile" | cut -d: -f1)
+unix=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_unix\.so' "$pamfile" | cut -d: -f1)
+afail=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so authfail' "$pamfile" | cut -d: -f1)
+asucc=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so authsucc' "$pamfile" | cut -d: -f1)
+# Bash arithmetic assertion без скрытых тестов/синтаксических подмен
+((pre < unix && unix < afail && afail < asucc)) || fail 'faillock order must be preauth < pam_unix < authfail < authsucc'
+grep -q 'auth \[success=1 default=bad\] pam_unix.so' "$pamfile" || fail 'pam_unix control flag must pass failed auth to authfail'
+# идемпотентность: второй enable не дублирует строки и сохраняет оригинал
+_pam_apply_faillock_auth "$pamfile" || fail 'reapplying faillock stack failed'
+[[ $(grep -cE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so preauth' "$pamfile") == 1 ]] || fail 'faillock preauth duplicated'
+[[ $(grep -cE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so authfail' "$pamfile") == 1 ]] || fail 'faillock authfail duplicated'
+_pam_remove_faillock_auth "$pamfile" || fail 'faillock stack did not disable cleanly'
+cmp -s "$pamfile" "$pamdir/original" || fail 'disabling faillock did not restore the original PAM stack byte-for-byte'
+# Legacy stack от старой версии должен мигрировать в правильный порядок и затем откатываться
+cat >"$pamfile" <<'PAM'
+# seq_vps faillock preauth (old)
+auth required pam_faillock.so preauth
+# seq_vps faillock authfail (old)
+auth [default=die] pam_faillock.so authfail
+auth [success=1 default=ignore] pam_unix.so nullok
+auth requisite pam_deny.so
+auth required pam_permit.so
+PAM
+# После миграции и disable ожидается чистый стек без старых faillock-вставок.
+printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\n' >"$pamdir/legacy-clean"
+_pam_apply_faillock_auth "$pamfile" || fail 'legacy faillock stack failed to migrate'
+pre=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so preauth' "$pamfile" | cut -d: -f1)
+unix=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_unix\.so' "$pamfile" | cut -d: -f1)
+afail=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so authfail' "$pamfile" | cut -d: -f1)
+asucc=$(grep -nE '^[[:space:]]*auth[[:space:]].*pam_faillock\.so authsucc' "$pamfile" | cut -d: -f1)
+((pre < unix && unix < afail && afail < asucc)) || fail 'legacy faillock stack was not reordered'
+_pam_remove_faillock_auth "$pamfile" || fail 'legacy faillock stack did not disable'
+cmp -s "$pamfile" "$pamdir/legacy-clean" || fail 'legacy disable did not restore clean PAM stack'
+# неизвестный стек с несколькими pam_unix-ами нельзя угадывать и частично менять
+printf 'auth required pam_unix.so nullok\nauth required pam_unix.so try_first_pass\n' >"$pamfile"
+cp "$pamfile" "$pamdir/unsupported"
+_pam_apply_faillock_auth "$pamfile" >/dev/null 2>&1 && fail 'faillock accepted an ambiguous multi-pam_unix stack' || true
+cmp -s "$pamfile" "$pamdir/unsupported" || fail 'unsupported PAM stack was partially modified'
+# чужую faillock-конфигурацию без маркера 4script тоже нельзя перезаписывать
+printf 'auth required pam_faillock.so preauth\nauth required pam_unix.so\n' >"$pamfile"
+cp "$pamfile" "$pamdir/third-party"
+_pam_apply_faillock_auth "$pamfile" >/dev/null 2>&1 && fail 'faillock overwrote a third-party PAM rule' || true
+cmp -s "$pamfile" "$pamdir/third-party" || fail 'third-party PAM stack was modified'
+# Authenticators before pam_unix need distro-specific ordering; fail closed.
+printf 'auth sufficient pam_sss.so\nauth required pam_unix.so nullok\n' >"$pamfile"
+cp "$pamfile" "$pamdir/preceding-auth"
+_pam_apply_faillock_auth "$pamfile" >/dev/null 2>&1 && fail 'faillock accepted an auth module before pam_unix' || true
+cmp -s "$pamfile" "$pamdir/preceding-auth" || fail 'unsupported auth order was partially modified'
+rm -rf "$pamdir"
+# pwquality пакетный postinst может изменить common-password: бэкап должен идти раньше установки
+pwq_body=$(sed -n '/^_pam_enable_pwquality()/,/^}/p' 4script.sh)
+backup_line=$(grep -n 'backup_file "$PAM_PASSWORD_FILE"' <<<"$pwq_body" | head -1 | cut -d: -f1)
+install_line=$(grep -n 'pkg_install_retry "libpam-pwquality"' <<<"$pwq_body" | head -1 | cut -d: -f1)
+[[ -n "$backup_line" && -n "$install_line" && $backup_line -lt $install_line ]] ||
+	fail 'pwquality PAM stack must be backed up before installing the package'
 
 # ── Перезапуск SSH после правки ключей ───────────────────────────────
 declare -F _ssh_after_keys_change >/dev/null || fail 'missing _ssh_after_keys_change'
